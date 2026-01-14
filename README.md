@@ -2,40 +2,81 @@
 
 A powerful, interactive CLI tool for F5 BIG-IP license lifecycle management. Manage licenses across multiple F5 devices from a single terminal interface.
 
-![Version](https://img.shields.io/badge/version-3.0-blue.svg)
-![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL-lightgrey.svg)
+![Version](https://img.shields.io/badge/version-3.2.1-blue.svg)
+![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20BSD%20%7C%20WSL-lightgrey.svg)
+![Bash](https://img.shields.io/badge/bash-3.2%2B-green.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 
 ## Features
 
-- 🖥️ **Interactive CLI** - Rich terminal interface with command history and tab completion
+- 🖥️ **Interactive CLI** - Rich terminal interface with command history and readline support
 - 📋 **Device Inventory** - Track multiple F5 devices in one place
 - 🔍 **License Monitoring** - Check license status across all devices
-- 🔄 **License Renewal** - Apply new licenses via REST API
-- 📝 **Dossier Generation** - Generate dossiers via REST API or SSH
+- ⚡ **Auto-Check on Add** - Automatically checks license status when adding devices
+- 🔄 **License Renewal** - Apply new licenses via REST API with automatic verification
+- 📝 **Dossier Generation** - Generate dossiers via REST API or SSH fallback
 - 🔐 **Secure** - Credentials never stored, used only for active session
 - 📊 **Export** - Export device inventory to CSV
+- 🌍 **Cross-Platform** - Works on Linux, macOS, FreeBSD, WSL, Cygwin
+
+## Compatibility
+
+| Platform | Tested | Notes |
+|----------|--------|-------|
+| Ubuntu/Debian | ✅ | Full support |
+| RHEL/CentOS/Fedora | ✅ | Full support |
+| Alpine Linux | ✅ | Full support |
+| macOS (Intel/Apple Silicon) | ✅ | Full support |
+| FreeBSD | ✅ | Full support |
+| WSL/WSL2 | ✅ | Full support |
+| Cygwin/MSYS2 | ✅ | Full support |
+| Git Bash | ✅ | Limited (no SSH) |
+
+**Terminal Support:**
+- Works with or without UTF-8 (automatic fallback to ASCII)
+- Works with or without color support (automatic detection)
+- Respects `NO_COLOR` environment variable
+- Works in dumb terminals (e.g., CI/CD pipelines)
+
+---
 
 ## Requirements
 
-- **bash** (4.0+)
+**Required:**
+- **bash** 3.2 or later (macOS default works!)
 - **curl**
 - **jq**
-- **sshpass** (optional, for SSH-based operations)
+
+**Optional (for SSH operations):**
+- **sshpass** - For SSH password authentication
+- **expect** - Alternative for SSH password authentication (pre-installed on macOS)
 
 ### Installation of Dependencies
 
 ```bash
-# macOS
-brew install curl jq
-brew install hudochenkov/sshpass/sshpass  # Optional
+# Debian/Ubuntu
+sudo apt-get install curl jq sshpass
 
-# Ubuntu/Debian
-sudo apt install curl jq sshpass
-
-# RHEL/CentOS
+# RHEL/CentOS/Fedora
 sudo yum install curl jq sshpass
+# or
+sudo dnf install curl jq sshpass
+
+# Alpine Linux
+apk add curl jq openssh-client sshpass
+
+# Arch Linux
+pacman -S curl jq sshpass
+
+# macOS (Homebrew)
+brew install curl jq
+brew install hudochenkov/sshpass/sshpass  # Optional - expect is pre-installed
+
+# FreeBSD
+pkg install curl jq sshpass
 ```
+
+---
 
 ## Installation
 
@@ -50,6 +91,8 @@ chmod +x f5lm
 sudo mv f5lm /usr/local/bin/
 ```
 
+---
+
 ## Quick Start
 
 ```bash
@@ -61,10 +104,12 @@ sudo mv f5lm /usr/local/bin/
 ./f5lm check all
 ```
 
+---
+
 ## Interface
 
 ```
-  ███████╗███████╗   License Manager v3.0
+  ███████╗███████╗   License Manager v3.2.1
   ██╔════╝██╔════╝   F5 BIG-IP License Lifecycle Tool
   █████╗  ███████╗
   ██╔══╝  ╚════██║   Type help for commands
@@ -80,12 +125,12 @@ sudo mv f5lm /usr/local/bin/
 
   DEVICES
 
-  #   IP ADDRESS         EXPIRES        DAYS     STATUS
+  #   IP ADDRESS         EXPIRES        DAYS       STATUS
   --------------------------------------------------------------
-  1   192.168.1.100      2026/06/15     152      ● active
-  2   10.0.0.50          2025/02/10     27       ● expiring
-  3   172.16.0.10        2024/12/01     -44      ● expired
-  4   40.90.199.87       Perpetual      ∞        ● active
+  1   192.168.1.100      2026/06/15     152        ● active
+  2   10.0.0.50          2025/02/10     27         ● expiring
+  3   172.16.0.10        2024/12/01     -44        ● expired
+  4   40.90.199.87       -              ?          ○ new
 
   f5lm > _
 ```
@@ -96,32 +141,25 @@ sudo mv f5lm /usr/local/bin/
 
 ### Device Management
 
-#### `add <ip> [label]`
-Add a single F5 device to the inventory.
+#### `add <ip>`
+Add a single F5 device to the inventory. **Automatically checks license status** if credentials are available.
 
 ```bash
 f5lm > add 192.168.1.100
 
   [OK] Added 192.168.1.100
-       Run 'check 192.168.1.100' to fetch license info
-```
-
-With optional label:
-```bash
-f5lm > add 10.0.0.50 production-ltm
-
-  [OK] Added 10.0.0.50
-       Run 'check 10.0.0.50' to fetch license info
+  >>> Checking license status...
+  192.168.1.100        ● 152 days
 ```
 
 #### `add-multi`
-Add multiple devices interactively.
+Add multiple devices interactively. **Automatically checks all added devices** after input is complete.
 
 ```bash
 f5lm > add-multi
 
   ADD MULTIPLE DEVICES
-  Enter IP addresses, one per line. Empty line to finish.
+  Enter IPs, one per line. Empty line to finish.
 
   IP: 192.168.1.100
   [OK] Added 192.168.1.100
@@ -132,6 +170,20 @@ f5lm > add-multi
   IP: 
 
   [OK] Added 3 device(s)
+
+  Checking license status...
+
+  Enter F5 Credentials
+  (credentials are never stored)
+
+  Username: admin
+  Password: 
+
+  192.168.1.100        ● 152 days
+  192.168.1.101        ● 365 days
+  192.168.1.102        ! 25 days
+
+  [OK] Checked 3 device(s)
 ```
 
 #### `remove <ip>`
@@ -152,11 +204,11 @@ f5lm > list
 
   DEVICES
 
-  #   IP ADDRESS         EXPIRES        DAYS     STATUS
+  #   IP ADDRESS         EXPIRES        DAYS       STATUS
   --------------------------------------------------------------
-  1   192.168.1.100      2026/06/15     152      ● active
-  2   10.0.0.50          2025/02/10     27       ● expiring
-  3   172.16.0.10        2024/12/01     -44      ● expired
+  1   192.168.1.100      2026/06/15     152        ● active
+  2   10.0.0.50          2025/02/10     27         ● expiring
+  3   172.16.0.10        2024/12/01     -44        ● expired
 ```
 
 ---
@@ -238,20 +290,20 @@ Apply a new license using a registration key via REST API.
 ```bash
 f5lm > renew 10.0.0.50 XXXXX-XXXXX-XXXXX-XXXXX-XXXXXXX
 
-  ⚠ WARNING
+  WARNING
   License renewal will restart services on the device.
   This may cause brief traffic interruption.
   Recommended: Perform during maintenance window.
 
-  Proceed with license renewal? [y/N]: y
+  Proceed? [y/N]: y
 
   >>> Connecting to 10.0.0.50...
   >>> Installing license...
-  [OK] License installed successfully!
+  [OK] License installed!
 
-  >>> Device is applying license (services restarting)...
-  Waiting for device to become available (up to 120s)...
-  ⏳ Checking... (30s/120s)
+  >>> Device applying license (services restarting)...
+  Waiting for device (up to 120s)...
+  Checking... (30s/120s)
   [OK] Device is back online
 
   LICENSE STATUS
@@ -264,8 +316,8 @@ Reload the license file on a device via SSH (after manually copying license to `
 ```bash
 f5lm > reload 10.0.0.50
 
-  ⚠ WARNING
-  License reload will restart services on the device.
+  WARNING
+  License reload will restart services.
   Recommended: Perform during maintenance window.
 
   Proceed? [y/N]: y
@@ -273,9 +325,9 @@ f5lm > reload 10.0.0.50
   >>> Reloading license on 10.0.0.50...
   [OK] License reload initiated
 
-  >>> Device is applying license (services restarting)...
-  Waiting for device to become available (up to 120s)...
-  ⏳ Checking... (20s/120s)
+  >>> Device applying license...
+  Waiting for device (up to 120s)...
+  Checking... (20s/120s)
   [OK] Device is back online
 
   LICENSE STATUS
@@ -292,7 +344,7 @@ f5lm > dossier 192.168.1.100
   >>> Retrieving registration key...
   [OK] Found registration key: ABCDE-FGHIJ-KLMNO-PQRST-UVWXYZZ
   >>> Generating dossier via REST API...
-  [WARN] REST API not available
+  [WARN] REST API not available (Public URI path not registered)
   >>> Trying SSH method...
   [OK] Dossier retrieved via SSH
 
@@ -302,8 +354,7 @@ f5lm > dossier 192.168.1.100
   ------------------------------------------------------------
   4abb9dc68daa958e8396f7a39ea4ad4f6caa6e594c557d9c1ebab059e9
   ef43dbf4fb9502ea42045aabfc35923b72f6c6612a633c01955e520aae
-  5f51143b8affbf8a019622c8ecc7842af452fb948b668a1bfebeec350e
-  0fcf26d85e7769c1551aa08f908d17cf54397afc0982575deb452201240
+  ...
   ------------------------------------------------------------
 
   NEXT STEPS
@@ -313,42 +364,57 @@ f5lm > dossier 192.168.1.100
   4. Download license file, or copy content to /config/bigip.license
   5. Reload the license: reload 192.168.1.100 (or SSH: reloadlic)
 
-  Saved to: /home/user/.f5lm/dossier_192_168_1_100.txt
+  Saved to: /Users/you/.f5lm/dossier_192_168_1_100.txt
 ```
 
-With explicit registration key:
+**If SSH fails, offers interactive session:**
 ```bash
-f5lm > dossier 192.168.1.100 XXXXX-XXXXX-XXXXX-XXXXX-XXXXXXX
+  [ERROR] SSH dossier generation failed
+
+  MANUAL DOSSIER GENERATION
+
+  SSH to the F5 device and run:
+
+    ssh admin@192.168.1.100
+    bash  (if not already in bash)
+    get_dossier -b ABCDE-FGHIJ-KLMNO-PQRST-UVWXYZZ
+
+  Then paste the dossier at:
+    https://activate.f5.com/license/dossier.jsp
+
+  Try interactive SSH now? [y/N]: y
+
+  >>> Opening SSH session to 192.168.1.100...
+  Run: get_dossier -b ABCDE-FGHIJ-KLMNO-PQRST-UVWXYZZ
+  Then copy the output and type 'exit' to return
 ```
 
 #### `activate <ip>`
-Interactive license activation wizard.
+Interactive license activation wizard that guides you through the process.
 
 ```bash
 f5lm > activate 192.168.1.100
 
   LICENSE ACTIVATION WIZARD
-  Follow these steps to activate a license on 192.168.1.100
+  Activate license on 192.168.1.100
 
   Step 1: Get Dossier
-  The dossier uniquely identifies your F5 device.
+  The dossier identifies your device.
 
   Retrieve dossier now? [Y/n]: y
-  
-  [dossier output...]
+  ...
 
   Step 2: Get License from F5
 
   1. Visit: https://activate.f5.com/license
-  2. Paste your dossier string
-  3. Enter your base registration key
-  4. Download or copy the license
+  2. Paste your dossier
+  3. Enter registration key
+  4. Download license
 
   Step 3: Apply License
 
-  Enter registration key (or press Enter to skip): XXXXX-XXXXX-XXXXX-XXXXX
-  
-  [renewal process...]
+  Enter registration key (or Enter to skip): XXXXX-XXXXX-XXXXX-XXXXX-XXXXXXX
+  ...
 ```
 
 ---
@@ -356,19 +422,12 @@ f5lm > activate 192.168.1.100
 ### Utilities
 
 #### `export`
-Export device inventory to CSV file.
+Export all device data to CSV.
 
 ```bash
 f5lm > export
 
-  [OK] Exported to /home/user/.f5lm/export_20250115_143022.csv
-```
-
-CSV format:
-```csv
-ip,expires,days,status,regkey,checked
-"192.168.1.100","2026/06/15","152","active","ABCDE-XXXXX","2025-01-15T14:30:22Z"
-"10.0.0.50","2025/02/10","27","expiring","FGHIJ-XXXXX","2025-01-15T14:30:22Z"
+  [OK] Exported to /Users/you/.f5lm/export_20250115_143022.csv
 ```
 
 #### `history`
@@ -380,7 +439,9 @@ f5lm > history
   RECENT HISTORY
 
   [2025-01-15 14:30:22] ADDED 192.168.1.100
-  [2025-01-15 14:30:45] CHECKED 192.168.1.100: active (152 days)
+  [2025-01-15 14:30:22] CHECKED 192.168.1.100: active (152 days)
+  [2025-01-15 14:30:45] ADDED 192.168.1.101
+  [2025-01-15 14:30:45] CHECKED 192.168.1.101: active (365 days)
   [2025-01-15 14:31:02] RENEWED 10.0.0.50 with XXXXX-XXXXX...
   [2025-01-15 14:35:18] DOSSIER 172.16.0.10 (ZZZZZ-XXXXX)
 ```
@@ -388,58 +449,11 @@ f5lm > history
 #### `refresh`
 Clear screen and refresh the display.
 
-```bash
-f5lm > refresh
-```
-
 #### `help`
 Display command help.
 
-```bash
-f5lm > help
-
-  COMMANDS
-
-  Managing Devices
-    add <ip>              Add single device
-    add-multi             Add multiple devices
-    remove <ip>           Remove device
-    list                  Show all devices
-
-  License Operations
-    check [ip|all]        Check license status
-    details <ip>          Show full license info
-    renew <ip> <key>      Apply registration key (REST API)
-    reload <ip>           Reload license file (SSH)
-    activate <ip>         License activation wizard
-    dossier <ip> [key]    Generate device dossier (REST or SSH)
-
-  Utilities
-    export                Export to CSV
-    history               Show action log
-    refresh               Refresh display
-    help                  This help
-    quit                  Exit
-
-  Shortcuts
-    a=add, r=remove, c=check, d=details, q=quit
-
-  Keyboard
-    ↑/↓        Command history
-    ←/→        Move cursor in line
-    Ctrl+A/E   Start/end of line
-    Ctrl+W     Delete word
-    Ctrl+C     Cancel current input
-```
-
 #### `quit`
 Exit the tool.
-
-```bash
-f5lm > quit
-
-  Goodbye!
-```
 
 ---
 
@@ -454,6 +468,7 @@ f5lm > quit
 | `◌ pending` | Pending | Connected but license data not ready |
 | `○ new` | New | Device added, not yet checked |
 | `○ unknown` | Unknown | Unable to determine license status |
+| `◌ unreachable` | Unreachable | Cannot connect to device |
 
 ---
 
@@ -463,25 +478,42 @@ f5lm > quit
 |----------|-------------|
 | `F5_USER` | F5 username (avoids interactive prompt) |
 | `F5_PASS` | F5 password (avoids interactive prompt) |
+| `NO_COLOR` | Disable color output |
+| `F5LM_NO_COLOR` | Disable color output (alternative) |
+| `XDG_DATA_HOME` | Custom data directory (default: `~/.f5lm`) |
 
 **Example for automation:**
 ```bash
 export F5_USER=admin
 export F5_PASS=mypassword
+./f5lm add 192.168.1.100    # Auto-checks immediately
 ./f5lm check all
+```
+
+**CI/CD Pipeline Example:**
+```bash
+#!/bin/bash
+export F5_USER="$F5_USERNAME"
+export F5_PASS="$F5_PASSWORD"
+export NO_COLOR=1
+
+./f5lm add 10.0.0.50
+./f5lm add 10.0.0.51
+./f5lm check all
+./f5lm export
 ```
 
 ---
 
 ## Data Storage
 
-All data is stored locally in `~/.f5lm/`:
+All data is stored locally in `~/.f5lm/` (or `$XDG_DATA_HOME/f5lm/`):
 
 | File | Description |
 |------|-------------|
 | `devices.json` | Device inventory |
 | `history.log` | Action history |
-| `.history` | Command history |
+| `.cmd_history` | Command history (readline) |
 | `dossier_*.txt` | Generated dossiers |
 | `export_*.csv` | Exported data |
 
@@ -491,17 +523,22 @@ All data is stored locally in `~/.f5lm/`:
 
 ## Complete License Renewal Workflow
 
-### Option 1: Direct Renewal (if device has internet access)
+### Option 1: Direct Renewal (device has internet access)
 
 ```bash
-# 1. Add device
+# 1. Add device (auto-checks license)
 f5lm > add 10.0.0.50
 
-# 2. Check current license
-f5lm > check 10.0.0.50
+  [OK] Added 10.0.0.50
+  >>> Checking license status...
+  10.0.0.50            ● 30 days
 
-# 3. Renew with new registration key
+# 2. Renew with new registration key
 f5lm > renew 10.0.0.50 XXXXX-XXXXX-XXXXX-XXXXX-XXXXXXX
+
+  [OK] License installed!
+  [OK] Device is back online
+  10.0.0.50            ● 365 days
 ```
 
 ### Option 2: Manual Activation (air-gapped devices)
@@ -509,6 +546,9 @@ f5lm > renew 10.0.0.50 XXXXX-XXXXX-XXXXX-XXXXX-XXXXXXX
 ```bash
 # 1. Generate dossier
 f5lm > dossier 10.0.0.50
+
+  [OK] Dossier retrieved via SSH
+  ... (copy dossier output)
 
 # 2. Go to https://activate.f5.com/license/dossier.jsp
 #    - Paste dossier
@@ -520,6 +560,10 @@ scp license.txt admin@10.0.0.50:/config/bigip.license
 
 # 4. Reload license
 f5lm > reload 10.0.0.50
+
+  [OK] License reload initiated
+  [OK] Device is back online
+  10.0.0.50            ● 365 days
 ```
 
 ---
@@ -529,16 +573,20 @@ f5lm > reload 10.0.0.50
 Run commands directly from the shell:
 
 ```bash
-# Add device
-./f5lm add 192.168.1.100
-
-# Check all devices (requires F5_USER and F5_PASS)
+# Add device (with auto-check if credentials set)
 export F5_USER=admin
 export F5_PASS=password
+./f5lm add 192.168.1.100
+
+# Check all devices
 ./f5lm check all
 
 # Export inventory
 ./f5lm export
+
+# Show version
+./f5lm --version
+./f5lm -v
 
 # Show help
 ./f5lm --help
@@ -551,7 +599,6 @@ export F5_PASS=password
 
 | Key | Action |
 |-----|--------|
-| `Tab` | Auto-complete commands and IPs |
 | `↑` / `↓` | Browse command history |
 | `←` / `→` | Move cursor in line |
 | `Ctrl+A` | Jump to start of line |
@@ -561,36 +608,130 @@ export F5_PASS=password
 | `Ctrl+C` | Cancel current input |
 | `Ctrl+D` | Exit |
 
+**Command Shortcuts:**
+| Short | Command |
+|-------|---------|
+| `a` | `add` |
+| `am` | `add-multi` |
+| `r` | `remove` |
+| `c` | `check` |
+| `d` | `details` |
+| `l` | `list` |
+| `h` | `history` |
+| `q` | `quit` |
+
 ---
 
 ## Troubleshooting
 
-### Authentication Failed
+### Authentication Failed / Restarting
 ```
 10.0.0.50        ◌ restarting (services may be reloading)
 ```
 - Device may be restarting after license change
 - Wait 1-2 minutes and try again
+- The tool automatically waits up to 120 seconds after renew/reload
 
 ### SSH Dossier Failed
 ```
-[WARN] sshpass not installed
+[WARN] sshpass not installed - trying without password automation
 ```
-Install sshpass for password-based SSH:
+The tool tries multiple SSH methods in order:
+1. **sshpass** (if installed) - Best for automation
+2. **expect** (if installed) - Good fallback (pre-installed on macOS)
+3. **SSH keys** - If key-based auth is configured
+
+Install sshpass for best results:
 ```bash
 # macOS
 brew install hudochenkov/sshpass/sshpass
 
-# Ubuntu
-sudo apt install sshpass
+# Ubuntu/Debian
+sudo apt-get install sshpass
+
+# RHEL/CentOS
+sudo yum install sshpass
+
+# Alpine
+apk add sshpass
 ```
 
 ### REST API Not Available
 ```
 [WARN] REST API not available (Public URI path not registered)
 ```
-- Some F5 versions don't support dossier via REST
+- Some F5 versions don't support dossier via REST API
 - Tool automatically falls back to SSH method
+- This is normal behavior
+
+### No Colors in Terminal
+The tool automatically detects terminal capabilities. To force disable colors:
+```bash
+export NO_COLOR=1
+./f5lm
+```
+
+### Unicode Characters Not Displaying
+If you see garbled characters, your terminal may not support UTF-8:
+```bash
+# Check current locale
+locale
+
+# Set UTF-8 locale (Linux)
+export LANG=en_US.UTF-8
+
+# The tool will automatically use ASCII fallback if UTF-8 is not available
+```
+
+### Database Corrupted
+If you see "Database corrupted, creating backup":
+- The tool automatically recovers
+- Your old data is saved to `~/.f5lm/devices.json.bak.<timestamp>`
+- You can restore manually if needed
+
+### Bash Version Too Old
+```
+Error: Bash 3.2+ required
+```
+Upgrade bash:
+```bash
+# macOS (ships with bash 3.2, which is sufficient)
+brew install bash
+
+# Linux - bash 3.2+ is standard on all modern distros
+```
+
+---
+
+## Version History
+
+### v3.2.1 (Current)
+- **Auto-check on add** - Automatically checks license status when adding devices
+- **Improved add-multi** - Checks all devices after batch add with single credential prompt
+- **Better SSH fallback** - Uses sshpass, expect, or SSH keys in order of preference
+- **Interactive SSH option** - Offers to open SSH session if dossier generation fails
+
+### v3.2.0
+- **Cross-platform hardening** - Works on bash 3.2+ (macOS compatible)
+- **Portable date handling** - GNU and BSD date support
+- **Safe credential handling** - JSON escaping for special characters
+- **Automatic terminal detection** - UTF-8/ASCII, color/no-color
+- **Signal handling** - Clean exit on Ctrl+C
+- **Temp file cleanup** - Automatic cleanup on exit
+- **Timeout fallback** - Works without `timeout` command
+- **Better error messages** - "restarting" vs "auth failed"
+
+### v3.1.0
+- SSH-based dossier generation fallback
+- License reload command
+- Maintenance window warnings
+- Post-renewal verification with retry
+
+### v3.0.0
+- Initial public release
+- Interactive CLI interface
+- REST API integration
+- Device inventory management
 
 ---
 
@@ -598,11 +739,21 @@ sudo apt install sshpass
 
 MIT License - See [LICENSE](LICENSE) for details.
 
+---
+
 ## Contributing
 
 1. Fork the repository
 2. Create a feature branch
 3. Submit a pull request
+
+**Code Style:**
+- Use `printf` instead of `echo -e` for portability
+- Avoid bash 4+ specific features (for macOS compatibility)
+- Test on both Linux and macOS
+- Include shellcheck compliance
+
+---
 
 ## Support
 
