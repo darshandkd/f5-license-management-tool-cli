@@ -2,7 +2,7 @@
 
 A powerful, interactive CLI tool for F5 BIG-IP license lifecycle management. Manage licenses across multiple F5 devices from a single terminal interface.
 
-![Version](https://img.shields.io/badge/version-3.2.1-blue.svg)
+![Version](https://img.shields.io/badge/version-3.3.1-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20BSD%20%7C%20WSL-lightgrey.svg)
 ![Bash](https://img.shields.io/badge/bash-3.2%2B-green.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
@@ -15,6 +15,7 @@ A powerful, interactive CLI tool for F5 BIG-IP license lifecycle management. Man
 - ⚡ **Auto-Check on Add** - Automatically checks license status when adding devices
 - 🔄 **License Renewal** - Apply new licenses via REST API with automatic verification
 - 📝 **Dossier Generation** - Generate dossiers via REST API or SSH fallback
+- 🎯 **One-Step License Application** - Paste or upload license directly from the tool
 - 🔐 **Secure** - Credentials never stored, used only for active session
 - 📊 **Export** - Export device inventory to CSV
 - 🌍 **Cross-Platform** - Works on Linux, macOS, FreeBSD, WSL, Cygwin
@@ -109,7 +110,7 @@ sudo mv f5lm /usr/local/bin/
 ## Interface
 
 ```
-  ███████╗███████╗   License Manager v3.2.1
+  ███████╗███████╗   License Manager v3.3.1
   ██╔════╝██╔════╝   F5 BIG-IP License Lifecycle Tool
   █████╗  ███████╗
   ██╔══╝  ╚════██║   Type help for commands
@@ -335,7 +336,7 @@ f5lm > reload 10.0.0.50
 ```
 
 #### `dossier <ip> [registration-key]`
-Generate a dossier for manual license activation. Tries REST API first, falls back to SSH.
+Generate a dossier for license activation. After generating the dossier, you can **apply the license directly** from within the tool - no need to SSH separately!
 
 ```bash
 f5lm > dossier 192.168.1.100
@@ -357,36 +358,106 @@ f5lm > dossier 192.168.1.100
   ...
   ------------------------------------------------------------
 
-  NEXT STEPS
-  1. Copy the dossier above
-  2. Go to: https://activate.f5.com/license/dossier.jsp
-  3. Paste the dossier and click Next
-  4. Download license file, or copy content to /config/bigip.license
-  5. Reload the license: reload 192.168.1.100 (or SSH: reloadlic)
-
   Saved to: /Users/you/.f5lm/dossier_192_168_1_100.txt
+
+  ╔═════════════════════════════════════════════════════════════════╗
+  ║  APPLY LICENSE                                                  ║
+  ╠═════════════════════════════════════════════════════════════════╣
+  ║  1. Open F5 license portal and get license                      ║
+  ║     https://activate.f5.com/license/dossier.jsp                 ║
+  ║                                                                 ║
+  ║  After getting the license, choose how to apply it:            ║
+  ║                                                                 ║
+  ║  [P] Paste license content here                                ║
+  ║  [F] Upload license from local file                            ║
+  ║  [S] Skip - apply license manually later                       ║
+  ╚═════════════════════════════════════════════════════════════════╝
+
+  Choice [P/F/S]: P
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  PASTE LICENSE CONTENT                                          │
+  │  (Paste the license text, then press Enter twice to finish)     │
+  └─────────────────────────────────────────────────────────────────┘
+
+  [paste license content here...]
+
+
+  [OK] License content loaded (127 lines)
+
+  WARNING
+  This will overwrite the existing license and restart services.
+  A backup will be created at /var/tmp/bigip.license.backup.*
+
+  Proceed? [y/N]: y
+
+  >>> Establishing SSH connection...
+  (root@192.168.1.100) Password: ****
+
+  >>> Backing up existing license...
+    Backup: /var/tmp/bigip.license.backup.20250115_143022
+  >>> Writing license to device...
+  [OK] License written to device
+
+  >>> Reloading license configuration...
+  [OK] License reload initiated
+
+  >>> Waiting for services to restart...
+  Checking... (30s/120s)
+  [OK] Device is back online
+
+  LICENSE STATUS
+  192.168.1.100        ● 365 days (exp: 2026/01/15)
 ```
 
-**If SSH fails, offers interactive session:**
+> **Note:** Only one password prompt is required. SSH connection multiplexing reuses the authenticated connection for backup, upload, and reload operations.
+
+**Upload from file instead of pasting:**
 ```bash
-  [ERROR] SSH dossier generation failed
+  Choice [P/F/S]: F
 
-  MANUAL DOSSIER GENERATION
+  Enter path to license file: ~/Downloads/bigip.license
+  
+  >>> Reading license from file...
+  [OK] License content loaded (127 lines)
+  ...
+```
 
-  SSH to the F5 device and run:
+#### `apply-license <ip> [license-file]`
+Apply a license file or content to a device. Use this if you already have the license and want to apply it without generating a new dossier.
 
-    ssh admin@192.168.1.100
-    bash  (if not already in bash)
-    get_dossier -b ABCDE-FGHIJ-KLMNO-PQRST-UVWXYZZ
+```bash
+# Apply by pasting content
+f5lm > apply-license 10.0.0.50
 
-  Then paste the dossier at:
-    https://activate.f5.com/license/dossier.jsp
+  APPLY LICENSE
+  Target device: 10.0.0.50
 
-  Try interactive SSH now? [y/N]: y
+  How would you like to provide the license?
 
-  >>> Opening SSH session to 192.168.1.100...
-  Run: get_dossier -b ABCDE-FGHIJ-KLMNO-PQRST-UVWXYZZ
-  Then copy the output and type 'exit' to return
+    [P] Paste license content
+    [F] Load from file
+
+  Choice [P/F]: P
+  ...
+
+# Or directly from file
+f5lm > apply-license 10.0.0.50 ~/Downloads/license.txt
+
+  APPLY LICENSE
+  Target device: 10.0.0.50
+
+  >>> Reading license from file: /home/user/Downloads/license.txt
+  [OK] License content loaded (127 lines)
+
+  WARNING
+  This will:
+    • Backup existing license to /var/tmp/bigip.license.backup.*
+    • Overwrite /config/bigip.license
+    • Restart F5 services (brief traffic interruption)
+
+  Proceed? [y/N]: y
+  ...
 ```
 
 #### `activate <ip>`
@@ -705,11 +776,24 @@ brew install bash
 
 ## Version History
 
-### v3.2.1 (Current)
+### v3.3.1 (Current)
+- **SSH connection multiplexing** - Single password prompt for all license operations (backup, upload, reload)
+- **Fixed license paste** - Header text no longer included in license file content
+- **Cleaner output** - UI prompts sent to stderr, only data captured in variables
+
+### v3.3.0
+- **Integrated license application** - Apply license directly from dossier command (paste or file upload)
+- **New `apply-license` command** - Standalone command to apply license file/content
+- **Automatic license backup** - Creates backup at `/var/tmp/bigip.license.backup.*` before overwriting
+- **License validation** - Basic validation of license content before applying
+- **Streamlined workflow** - Complete license renewal without leaving the tool
+
+### v3.2.1
 - **Auto-check on add** - Automatically checks license status when adding devices
 - **Improved add-multi** - Checks all devices after batch add with single credential prompt
 - **Better SSH fallback** - Uses sshpass, expect, or SSH keys in order of preference
 - **Interactive SSH option** - Offers to open SSH session if dossier generation fails
+- **Better error messages** - Distinguishes "auth failed" from "unreachable" and "restarting"
 
 ### v3.2.0
 - **Cross-platform hardening** - Works on bash 3.2+ (macOS compatible)
@@ -719,7 +803,6 @@ brew install bash
 - **Signal handling** - Clean exit on Ctrl+C
 - **Temp file cleanup** - Automatic cleanup on exit
 - **Timeout fallback** - Works without `timeout` command
-- **Better error messages** - "restarting" vs "auth failed"
 
 ### v3.1.0
 - SSH-based dossier generation fallback
