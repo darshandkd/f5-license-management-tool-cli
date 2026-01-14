@@ -22,7 +22,7 @@
 set -o pipefail 2>/dev/null || true
 
 # Script metadata
-readonly F5LM_VERSION="3.2.0"
+readonly F5LM_VERSION="3.3.0"
 readonly F5LM_NAME="F5 License Manager"
 
 # Exit codes
@@ -495,6 +495,8 @@ db_remove() {
 # CREDENTIAL HANDLING
 #-------------------------------------------------------------------------------
 prompt_credentials() {
+    local context="${1:-}"
+    
     # Already have credentials from environment
     if [[ -n "$F5_USER" && -n "$F5_PASS" ]]; then
         return 0
@@ -502,6 +504,9 @@ prompt_credentials() {
     
     printf '\n'
     msg "  ${C}Enter F5 Credentials${RS}"
+    if [[ -n "$context" ]]; then
+        msg "  ${D}For: ${context}${RS}"
+    fi
     msg "  ${D}(credentials are never stored)${RS}"
     printf '\n'
     
@@ -921,7 +926,8 @@ cmd_help() {
     printf '    %bdetails%b <ip>          Full license info\n' "$BD" "$RS"
     printf '    %brenew%b <ip> <key>      Apply registration key\n' "$BD" "$RS"
     printf '    %breload%b <ip>           Reload license (SSH)\n' "$BD" "$RS"
-    printf '    %bdossier%b <ip> [key]    Generate dossier\n' "$BD" "$RS"
+    printf '    %bdossier%b <ip> [key]    Generate dossier + apply license\n' "$BD" "$RS"
+    printf '    %bapply-license%b <ip>    Apply license file/content\n' "$BD" "$RS"
     printf '    %bactivate%b <ip>         Activation wizard\n' "$BD" "$RS"
     printf '\n'
     printf '  %bUtilities%b\n' "$C" "$RS"
@@ -950,7 +956,14 @@ _check_single_device() {
     token=$(echo "$auth_resp" | jq -r '.token.token // empty' 2>/dev/null)
     
     if [[ -z "$token" ]]; then
-        printf '%b%s unreachable%b\n' "$Y" "$SYM_WAIT" "$RS"
+        # Determine the reason for failure
+        if [[ -z "$auth_resp" ]]; then
+            printf '%b%s unreachable%b\n' "$R" "$SYM_ERR" "$RS"
+        elif printf '%s' "$auth_resp" | grep -qi "unauthorized\|Authentication failed\|invalid.*credentials\|401"; then
+            printf '%b%s auth failed%b\n' "$R" "$SYM_ERR" "$RS"
+        else
+            printf '%b%s failed%b\n' "$R" "$SYM_ERR" "$RS"
+        fi
         return 1
     fi
     
@@ -1008,13 +1021,25 @@ cmd_add() {
     if db_add "$ip"; then
         msg_ok "Added ${BD}$ip${RS}"
         
-        # Auto-check if credentials are available
-        if [[ -n "$F5_USER" && -n "$F5_PASS" ]]; then
-            msg_info "Checking license status..."
-            _check_single_device "$ip"
-        else
-            printf '      %bRun "check %s" to fetch license info%b\n' "$D" "$ip" "$RS"
+        # Auto-check - prompt for credentials if not in environment
+        msg_info "Checking license status..."
+        
+        if [[ -z "$F5_USER" || -z "$F5_PASS" ]]; then
+            printf '  %bEnter credentials for %b%s%b\n' "$D" "$BD" "$ip" "$RS"
+            printf '  Username: '
+            read -r F5_USER
+            printf '  Password: '
+            read -rs F5_PASS
+            printf '\n\n'
+            
+            if [[ -z "$F5_USER" || -z "$F5_PASS" ]]; then
+                printf '      %bRun "check %s" to fetch license info%b\n' "$D" "$ip" "$RS"
+                F5_USER="" F5_PASS=""
+                return 0
+            fi
         fi
+        
+        _check_single_device "$ip"
     else
         msg_err "Failed to add $ip"
         return 1
@@ -1066,27 +1091,90 @@ cmd_add_multi() {
     printf '  %bChecking license status...%b\n' "$BD" "$RS"
     printf '\n'
     
-    # Prompt for credentials if not set
-    if [[ -z "$F5_USER" || -z "$F5_PASS" ]]; then
-        prompt_credentials || {
-            msg_warn "Skipping auto-check (no credentials)"
-            printf '      %bRun "check all" to fetch license info%b\n' "$D" "$RS"
-            return
-        }
-    fi
+    local ok=0 fail=0 skipped=0
+    local current_user="" current_pass=""
     
-    local ok=0 fail=0
     for ip in $added_ips; do
-        if _check_single_device "$ip"; then
-            ok=$((ok + 1))
+        # Prompt for credentials for this device (unless we have env vars)
+        if [[ -n "$F5_USER" && -n "$F5_PASS" ]]; then
+            current_user="$F5_USER"
+            current_pass="$F5_PASS"
         else
-            fail=$((fail + 1))
+            printf '  %bEnter credentials for %b%s%b\n' "$D" "$BD" "$ip" "$RS"
+            printf '  Username: '
+            read -r current_user
+            printf '  Password: '
+            read -rs current_pass
+            printf '\n\n'
+            
+            if [[ -z "$current_user" || -z "$current_pass" ]]; then
+                printf '  %-20s %b%s skipped%b\n' "$ip" "$Y" "$SYM_WAIT" "$RS"
+                skipped=$((skipped + 1))
+                continue
+            fi
         fi
+        
+        printf '  %-20s ' "$ip"
+        
+        # Temporarily set credentials for API calls
+        local saved_user="$F5_USER" saved_pass="$F5_PASS"
+        F5_USER="$current_user"
+        F5_PASS="$current_pass"
+        
+        local auth_resp token
+        auth_resp=$(f5_auth "$ip" 10)
+        token=$(echo "$auth_resp" | jq -r '.token.token // empty' 2>/dev/null)
+        
+        if [[ -z "$token" ]]; then
+            # Determine the reason for failure
+            if [[ -z "$auth_resp" ]]; then
+                printf '%b%s unreachable%b\n' "$R" "$SYM_ERR" "$RS"
+            elif printf '%s' "$auth_resp" | grep -qi "unauthorized\|Authentication failed\|invalid.*credentials\|401"; then
+                printf '%b%s auth failed%b\n' "$R" "$SYM_ERR" "$RS"
+            else
+                printf '%b%s failed%b\n' "$R" "$SYM_ERR" "$RS"
+            fi
+            fail=$((fail + 1))
+            F5_USER="$saved_user"
+            F5_PASS="$saved_pass"
+            continue
+        fi
+        
+        local lic_json parsed regkey expires days status
+        lic_json=$(f5_get_license "$ip" "$token" 10)
+        parsed=$(parse_license_info "$lic_json")
+        regkey="${parsed%%|*}"
+        expires="${parsed##*|}"
+        
+        # Restore credentials
+        F5_USER="$saved_user"
+        F5_PASS="$saved_pass"
+        
+        if [[ -z "$expires" ]]; then
+            printf '%b%s no license data%b\n' "$Y" "$SYM_WAIT" "$RS"
+            fail=$((fail + 1))
+            continue
+        fi
+        
+        days=$(calc_days_until "$expires")
+        status=$(get_status_from_days "$days")
+        
+        db_update "$ip" "$expires" "$days" "$status" "$regkey"
+        log_event "CHECKED $ip: $status ($days days)"
+        
+        case "$status" in
+            active)   printf '%b%s %s days%b\n' "$G" "$SYM_OK" "$days" "$RS" ;;
+            expiring) printf '%b%s %s days%b\n' "$Y" "$SYM_WARN" "$days" "$RS" ;;
+            expired)  printf '%b%s EXPIRED%b\n' "$R" "$SYM_ERR" "$RS" ;;
+            *)        printf '%b%s unknown%b\n' "$D" "$SYM_PENDING" "$RS" ;;
+        esac
+        ok=$((ok + 1))
     done
     
     printf '\n'
     [[ $ok -gt 0 ]] && msg_ok "Checked $ok device(s)"
     [[ $fail -gt 0 ]] && msg_warn "$fail device(s) unreachable"
+    [[ $skipped -gt 0 ]] && msg_warn "$skipped device(s) skipped (no credentials)"
 }
 
 #-------------------------------------------------------------------------------
@@ -1146,30 +1234,87 @@ cmd_check() {
         ips="$target"
     fi
     
-    prompt_credentials || return 1
-    
     printf '\n'
     printf '  %bCHECKING LICENSES%b\n' "$BD" "$RS"
     printf '\n'
     
-    local ok=0 fail=0 restarting=0
+    local ok=0 fail=0 restarting=0 skipped=0
     local ip
+    local current_user="" current_pass=""
     
-    # Read IPs line by line to handle spaces
+    # Convert to array to avoid subshell issues with read
+    local ip_array=()
     while IFS= read -r ip; do
+        [[ -n "$ip" ]] && ip_array+=("$ip")
+    done <<< "$ips"
+    
+    # Process each IP
+    for ip in "${ip_array[@]}"; do
         [[ -z "$ip" ]] && continue
+        
+        # Prompt for credentials for this device (unless we have env vars)
+        if [[ -n "$F5_USER" && -n "$F5_PASS" ]]; then
+            # Use environment credentials
+            current_user="$F5_USER"
+            current_pass="$F5_PASS"
+        else
+            # Prompt for this specific device - read from /dev/tty
+            printf '  %bEnter credentials for %b%s%b\n' "$D" "$BD" "$ip" "$RS"
+            printf '  Username: '
+            read -r current_user </dev/tty
+            printf '  Password: '
+            read -rs current_pass </dev/tty
+            printf '\n\n'
+            
+            if [[ -z "$current_user" || -z "$current_pass" ]]; then
+                printf '  %-20s %b%s skipped%b %b(no credentials)%b\n' \
+                    "$ip" "$Y" "$SYM_WAIT" "$RS" "$D" "$RS"
+                skipped=$((skipped + 1))
+                continue
+            fi
+        fi
         
         printf '  %-20s ' "$ip"
         
-        local auth_resp token
+        # Temporarily set credentials for API calls
+        local saved_user="$F5_USER" saved_pass="$F5_PASS"
+        F5_USER="$current_user"
+        F5_PASS="$current_pass"
+        
+        local auth_resp token auth_error
         auth_resp=$(f5_auth "$ip" 15)
         token=$(printf '%s' "$auth_resp" | jq -r '.token.token // empty' 2>/dev/null)
         
         if [[ -z "$token" ]]; then
-            printf '%b%s restarting%b %b(services may be reloading)%b\n' \
-                "$Y" "$SYM_WAIT" "$RS" "$D" "$RS"
-            restarting=$((restarting + 1))
+            # Determine the reason for failure
+            if [[ -z "$auth_resp" ]]; then
+                # Empty response = connection failure / unreachable
+                printf '%b%s unreachable%b %b(connection failed)%b\n' \
+                    "$R" "$SYM_ERR" "$RS" "$D" "$RS"
+            elif printf '%s' "$auth_resp" | grep -qi "unauthorized\|Authentication failed\|invalid.*credentials\|401"; then
+                # Auth failure - wrong username/password
+                printf '%b%s auth failed%b %b(invalid credentials)%b\n' \
+                    "$R" "$SYM_ERR" "$RS" "$D" "$RS"
+            elif printf '%s' "$auth_resp" | grep -qi "service unavailable\|503\|connection refused"; then
+                # Service unavailable - device may be restarting
+                printf '%b%s restarting%b %b(services may be reloading)%b\n' \
+                    "$Y" "$SYM_WAIT" "$RS" "$D" "$RS"
+                restarting=$((restarting + 1))
+            else
+                # Unknown error - show generic message
+                auth_error=$(printf '%s' "$auth_resp" | jq -r '.message // .error // empty' 2>/dev/null)
+                if [[ -n "$auth_error" ]]; then
+                    printf '%b%s failed%b %b(%s)%b\n' \
+                        "$R" "$SYM_ERR" "$RS" "$D" "$auth_error" "$RS"
+                else
+                    printf '%b%s failed%b %b(unknown error)%b\n' \
+                        "$R" "$SYM_ERR" "$RS" "$D" "$RS"
+                fi
+            fi
             fail=$((fail + 1))
+            # Restore credentials
+            F5_USER="$saved_user"
+            F5_PASS="$saved_pass"
             continue
         fi
         
@@ -1178,6 +1323,10 @@ cmd_check() {
         parsed=$(parse_license_info "$lic_json")
         regkey="${parsed%%|*}"
         expires="${parsed##*|}"
+        
+        # Restore credentials
+        F5_USER="$saved_user"
+        F5_PASS="$saved_pass"
         
         if [[ -z "$expires" ]]; then
             printf '%b%s pending%b %b(license data not ready)%b\n' \
@@ -1208,11 +1357,11 @@ cmd_check() {
                 ;;
         esac
         ok=$((ok + 1))
-        
-    done <<< "$ips"
+    done
     
     printf '\n'
     [[ $ok -gt 0 ]] && msg_ok "Checked $ok device(s)"
+    [[ $skipped -gt 0 ]] && msg_warn "$skipped device(s) skipped"
     if [[ $restarting -gt 0 ]]; then
         msg_warn "$restarting device(s) restarting - retry in 1-2 minutes"
     elif [[ $fail -gt 0 ]]; then
@@ -1298,7 +1447,7 @@ cmd_details() {
         return 1
     fi
     
-    prompt_credentials || return 1
+    prompt_credentials "$ip" || return 1
     
     printf '\n'
     msg_info "Fetching details for $ip..."
@@ -1398,7 +1547,7 @@ cmd_renew() {
         return 0
     fi
     
-    prompt_credentials || return 1
+    prompt_credentials "$ip" || return 1
     
     printf '\n'
     msg_info "Connecting to $ip..."
@@ -1457,7 +1606,7 @@ cmd_reload() {
         return 0
     fi
     
-    prompt_credentials || return 1
+    prompt_credentials "$ip" || return 1
     
     printf '\n'
     msg_info "Reloading license on $ip..."
@@ -1487,8 +1636,326 @@ cmd_reload() {
 }
 
 #-------------------------------------------------------------------------------
-# COMMANDS: DOSSIER
+# COMMANDS: APPLY-LICENSE (standalone license application)
 #-------------------------------------------------------------------------------
+cmd_apply_license() {
+    local ip="$1"
+    local source="${2:-}"
+    
+    if [[ -z "$ip" ]]; then
+        msg_err "Usage: apply-license <ip> [license-file]"
+        printf '      %bOr run without file to paste license content%b\n' "$D" "$RS"
+        return 1
+    fi
+    
+    prompt_credentials "$ip" || return 1
+    
+    printf '\n'
+    printf '  %bAPPLY LICENSE%b\n' "$BD" "$RS"
+    printf '  %bTarget device: %s%b\n' "$D" "$ip" "$RS"
+    printf '\n'
+    
+    local license_content=""
+    
+    if [[ -n "$source" ]]; then
+        # Source provided - check if it's a file
+        local license_file="${source/#\~/$HOME}"
+        
+        if [[ -f "$license_file" ]]; then
+            msg_info "Reading license from file: $license_file"
+            license_content=$(cat "$license_file")
+        else
+            msg_err "File not found: $license_file"
+            return 1
+        fi
+    else
+        # No source - prompt for choice
+        printf '  %bHow would you like to provide the license?%b\n' "$D" "$RS"
+        printf '\n'
+        printf '    %b[P]%b Paste license content\n' "$BD" "$RS"
+        printf '    %b[F]%b Load from file\n' "$BD" "$RS"
+        printf '\n'
+        printf '  Choice [P/F]: '
+        
+        local choice
+        read -r choice
+        
+        case "$choice" in
+            [Ff])
+                printf '  Enter path to license file: '
+                local license_file
+                read -r license_file
+                license_file="${license_file/#\~/$HOME}"
+                
+                if [[ ! -f "$license_file" ]]; then
+                    msg_err "File not found: $license_file"
+                    return 1
+                fi
+                
+                license_content=$(cat "$license_file")
+                ;;
+                
+            [Pp]|"")
+                license_content=$(_read_license_content)
+                ;;
+                
+            *)
+                msg_err "Invalid choice"
+                return 1
+                ;;
+        esac
+    fi
+    
+    if [[ -z "$license_content" ]]; then
+        msg_err "No license content provided"
+        return 1
+    fi
+    
+    # Validate
+    if ! _validate_license_content "$license_content"; then
+        msg_warn "License content may be incomplete or invalid"
+        printf '  Continue anyway? [y/N]: '
+        local cont
+        read -r cont
+        if [[ ! "$cont" =~ ^[Yy]$ ]]; then
+            msg "  ${D}Cancelled${RS}"
+            return 0
+        fi
+    fi
+    
+    # Show preview
+    local line_count
+    line_count=$(echo "$license_content" | wc -l | tr -d ' ')
+    msg_ok "License content loaded ($line_count lines)"
+    
+    printf '\n'
+    printf '  %bWARNING%b\n' "$Y" "$RS"
+    printf '  %bThis will:%b\n' "$D" "$RS"
+    printf '  %b  • Backup existing license to /var/tmp/bigip.license.backup.*%b\n' "$D" "$RS"
+    printf '  %b  • Overwrite /config/bigip.license%b\n' "$D" "$RS"
+    printf '  %b  • Restart F5 services (brief traffic interruption)%b\n' "$D" "$RS"
+    printf '\n'
+    printf '  Proceed? [y/N]: '
+    local proceed
+    read -r proceed
+    
+    if [[ ! "$proceed" =~ ^[Yy]$ ]]; then
+        msg "  ${D}Cancelled${RS}"
+        return 0
+    fi
+    
+    printf '\n'
+    if _write_license_content "$ip" "$license_content"; then
+        log_event "LICENSE_APPLIED $ip"
+        printf '\n'
+        msg_info "Waiting for services to restart..."
+        verify_with_retry "$ip" 120
+    else
+        msg_err "Failed to apply license"
+        return 1
+    fi
+}
+
+#-------------------------------------------------------------------------------
+# COMMANDS: DOSSIER (Enhanced with license application)
+#-------------------------------------------------------------------------------
+
+# SSH connection multiplexing for multiple operations with single password
+# Creates a control socket for connection reuse
+_ssh_control_path() {
+    local ip="$1"
+    echo "/tmp/f5lm-ssh-${ip//[.:]/_}-$$"
+}
+
+# Start SSH control master connection
+_ssh_start_control() {
+    local ip="$1"
+    local control_path
+    control_path=$(_ssh_control_path "$ip")
+    
+    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10"
+    ssh_opts="$ssh_opts -o ControlMaster=yes -o ControlPath=$control_path -o ControlPersist=60"
+    
+    # Start the control master in background
+    if ssh_has_sshpass; then
+        sshpass -p "$F5_PASS" ssh $ssh_opts -fN "$F5_USER@$ip" 2>/dev/null
+    else
+        ssh $ssh_opts -fN "$F5_USER@$ip" 2>/dev/null
+    fi
+    
+    return $?
+}
+
+# Stop SSH control master connection
+_ssh_stop_control() {
+    local ip="$1"
+    local control_path
+    control_path=$(_ssh_control_path "$ip")
+    
+    # Close the control master
+    ssh -o ControlPath="$control_path" -O exit "$F5_USER@$ip" 2>/dev/null
+    rm -f "$control_path" 2>/dev/null
+}
+
+# Run SSH command using existing control connection
+_ssh_run() {
+    local ip="$1"
+    local cmd="$2"
+    local control_path
+    control_path=$(_ssh_control_path "$ip")
+    
+    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+    ssh_opts="$ssh_opts -o ControlPath=$control_path"
+    
+    ssh $ssh_opts "$F5_USER@$ip" "$cmd" 2>/dev/null
+}
+
+# Run SCP using existing control connection
+_scp_run() {
+    local ip="$1"
+    local local_file="$2"
+    local remote_file="$3"
+    local control_path
+    control_path=$(_ssh_control_path "$ip")
+    
+    local scp_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+    scp_opts="$scp_opts -o ControlPath=$control_path"
+    
+    scp $scp_opts "$local_file" "$F5_USER@$ip:$remote_file" 2>/dev/null
+}
+
+# Apply license to device (backup, write, reload) with single SSH connection
+_apply_license_to_device() {
+    local ip="$1"
+    local license_content="$2"
+    local remote_file="/config/bigip.license"
+    local backup_file="/var/tmp/bigip.license.backup.$(date +%Y%m%d_%H%M%S)"
+    
+    # Start SSH control connection (single password prompt)
+    msg_info "Establishing SSH connection..."
+    if ! _ssh_start_control "$ip"; then
+        msg_err "Failed to establish SSH connection"
+        return 1
+    fi
+    
+    # Register cleanup
+    trap "_ssh_stop_control '$ip'" RETURN
+    
+    # Backup existing license
+    msg_info "Backing up existing license..."
+    _ssh_run "$ip" "cp $remote_file $backup_file 2>/dev/null || true"
+    msg "  ${D}Backup: $backup_file${RS}"
+    
+    # Create temp file with license content
+    local temp_file
+    temp_file=$(make_temp_file "license")
+    echo "$license_content" > "$temp_file"
+    
+    # Upload license
+    msg_info "Writing license to device..."
+    if ! _scp_run "$ip" "$temp_file" "$remote_file"; then
+        rm -f "$temp_file" 2>/dev/null
+        msg_err "Failed to write license file"
+        return 1
+    fi
+    rm -f "$temp_file" 2>/dev/null
+    
+    msg_ok "License written to device"
+    
+    # Reload license
+    printf '\n'
+    msg_info "Reloading license configuration..."
+    _ssh_run "$ip" "bash -c 'reloadlic'" 2>/dev/null
+    
+    if [[ $? -eq 0 ]]; then
+        msg_ok "License reload initiated"
+        return 0
+    else
+        msg_err "License reload may have failed"
+        msg "  ${D}Try running 'reloadlic' manually on the device${RS}"
+        return 1
+    fi
+}
+
+# Upload license file to F5 via SSH (SCP) - with connection reuse
+_upload_license_file() {
+    local ip="$1"
+    local local_file="$2"
+    
+    # Read file content and use the unified apply function
+    local license_content
+    license_content=$(cat "$local_file")
+    
+    _apply_license_to_device "$ip" "$license_content"
+    return $?
+}
+
+# Write license content directly to F5 via SSH - with connection reuse
+_write_license_content() {
+    local ip="$1"
+    local license_content="$2"
+    
+    _apply_license_to_device "$ip" "$license_content"
+    return $?
+}
+
+# Read multi-line input (license content) from user
+_read_license_content() {
+    local content=""
+    local line
+    local line_count=0
+    
+    # Print header to stderr so it doesn't get captured in the output
+    printf '\n' >&2
+    printf '  %b┌─────────────────────────────────────────────────────────────────┐%b\n' "$C" "$RS" >&2
+    printf '  %b│  PASTE LICENSE CONTENT                                          │%b\n' "$C" "$RS" >&2
+    printf '  %b│  %b(Paste the license text, then press Enter twice to finish)%b     │%b\n' "$C" "$D" "$C" "$RS" >&2
+    printf '  %b└─────────────────────────────────────────────────────────────────┘%b\n' "$C" "$RS" >&2
+    printf '\n' >&2
+    
+    local empty_lines=0
+    while IFS= read -r line; do
+        # Two consecutive empty lines = done
+        if [[ -z "$line" ]]; then
+            empty_lines=$((empty_lines + 1))
+            if [[ $empty_lines -ge 2 ]]; then
+                break
+            fi
+            content="${content}${line}"$'\n'
+        else
+            empty_lines=0
+            content="${content}${line}"$'\n'
+            line_count=$((line_count + 1))
+        fi
+    done
+    
+    # Trim trailing newlines
+    content="${content%$'\n'}"
+    content="${content%$'\n'}"
+    
+    if [[ $line_count -lt 5 ]]; then
+        return 1
+    fi
+    
+    echo "$content"
+}
+
+# Validate license content looks correct
+_validate_license_content() {
+    local content="$1"
+    
+    # Basic validation - F5 licenses have specific markers
+    if echo "$content" | grep -q "Auth vers"; then
+        return 0
+    elif echo "$content" | grep -q "Registration Key"; then
+        return 0
+    elif echo "$content" | grep -q "License"; then
+        return 0
+    fi
+    
+    return 1
+}
+
 cmd_dossier() {
     local ip="$1"
     local regkey="${2:-}"
@@ -1498,7 +1965,7 @@ cmd_dossier() {
         return 1
     fi
     
-    prompt_credentials || return 1
+    prompt_credentials "$ip" || return 1
     
     msg_info "Connecting to $ip..."
     
@@ -1617,19 +2084,156 @@ cmd_dossier() {
     echo "$dossier" | fold -w 58 | sed 's/^/  /'
     draw_line 60
     printf '\n'
-    printf '  %bNEXT STEPS%b\n' "$BD" "$RS"
-    printf '  %b1. Copy the dossier above%b\n' "$D" "$RS"
-    printf '  %b2. Go to: %bhttps://activate.f5.com/license/dossier.jsp%b\n' "$D" "$BD" "$RS"
-    printf '  %b3. Paste the dossier and click %bNext%b\n' "$D" "$BD" "$RS"
-    printf '  %b4. Download license file, or copy content to %b/config/bigip.license%b\n' "$D" "$BD" "$RS"
-    printf '  %b5. Reload the license: %breload %s%b (or SSH: reloadlic)%b\n' "$D" "$BD" "$ip" "$RS" "$D" "$RS"
+    
+    # Save dossier to file
+    local dossier_file="${DATA_DIR}/dossier_${ip//./_}.txt"
+    echo "$dossier" > "$dossier_file" 2>/dev/null
+    msg "  ${D}Saved to: $dossier_file${RS}"
     printf '\n'
     
-    local file="${DATA_DIR}/dossier_${ip//./_}.txt"
-    echo "$dossier" > "$file" 2>/dev/null
-    msg "  ${D}Saved to: $file${RS}"
-    
     log_event "DOSSIER $ip ($regkey)"
+    
+    #---------------------------------------------------------------------------
+    # LICENSE APPLICATION OPTIONS
+    #---------------------------------------------------------------------------
+    printf '  %b╔═════════════════════════════════════════════════════════════════╗%b\n' "$C" "$RS"
+    printf '  %b║  APPLY LICENSE                                                  ║%b\n' "$C" "$RS"
+    printf '  %b╠═════════════════════════════════════════════════════════════════╣%b\n' "$C" "$RS"
+    printf '  %b║  1. Open F5 license portal and get license                      ║%b\n' "$C" "$RS"
+    printf '  %b║     %bhttps://activate.f5.com/license/dossier.jsp%b                 %b║%b\n' "$C" "$BD" "$C" "$C" "$RS"
+    printf '  %b║                                                                 ║%b\n' "$C" "$RS"
+    printf '  %b║  After getting the license, choose how to apply it:            ║%b\n' "$C" "$RS"
+    printf '  %b║                                                                 ║%b\n' "$C" "$RS"
+    printf '  %b║  %b[P]%b Paste license content here                                ║%b\n' "$C" "$BD" "$C" "$RS"
+    printf '  %b║  %b[F]%b Upload license from local file                            ║%b\n' "$C" "$BD" "$C" "$RS"
+    printf '  %b║  %b[S]%b Skip - apply license manually later                       ║%b\n' "$C" "$BD" "$C" "$RS"
+    printf '  %b║                                                                 ║%b\n' "$C" "$RS"
+    printf '  %b╚═════════════════════════════════════════════════════════════════╝%b\n' "$C" "$RS"
+    printf '\n'
+    printf '  Choice [P/F/S]: '
+    
+    local choice
+    read -r choice
+    
+    case "$choice" in
+        [Pp])
+            # Paste license content
+            local license_content
+            license_content=$(_read_license_content)
+            
+            if [[ -z "$license_content" ]]; then
+                msg_err "No license content received"
+                return 1
+            fi
+            
+            # Validate
+            if ! _validate_license_content "$license_content"; then
+                msg_warn "License content may be incomplete or invalid"
+                printf '  Continue anyway? [y/N]: '
+                local cont
+                read -r cont
+                if [[ ! "$cont" =~ ^[Yy]$ ]]; then
+                    msg "  ${D}Cancelled${RS}"
+                    return 0
+                fi
+            fi
+            
+            printf '\n'
+            printf '  %bWARNING%b\n' "$Y" "$RS"
+            printf '  %bThis will overwrite the existing license and restart services.%b\n' "$D" "$RS"
+            printf '  %bA backup will be created at /var/tmp/bigip.license.backup.*%b\n' "$D" "$RS"
+            printf '\n'
+            printf '  Proceed? [y/N]: '
+            local proceed
+            read -r proceed
+            
+            if [[ ! "$proceed" =~ ^[Yy]$ ]]; then
+                msg "  ${D}Cancelled${RS}"
+                return 0
+            fi
+            
+            printf '\n'
+            if _write_license_content "$ip" "$license_content"; then
+                log_event "LICENSE_APPLIED $ip (paste)"
+                printf '\n'
+                msg_info "Waiting for services to restart..."
+                verify_with_retry "$ip" 120
+            else
+                msg_err "Failed to apply license"
+                return 1
+            fi
+            ;;
+            
+        [Ff])
+            # Upload from file
+            printf '\n'
+            printf '  Enter path to license file: '
+            local license_file
+            read -r license_file
+            
+            # Expand ~ and handle paths
+            license_file="${license_file/#\~/$HOME}"
+            
+            if [[ ! -f "$license_file" ]]; then
+                msg_err "File not found: $license_file"
+                return 1
+            fi
+            
+            # Validate file content
+            if ! _validate_license_content "$(cat "$license_file")"; then
+                msg_warn "File may not contain valid license data"
+                printf '  Continue anyway? [y/N]: '
+                local cont
+                read -r cont
+                if [[ ! "$cont" =~ ^[Yy]$ ]]; then
+                    msg "  ${D}Cancelled${RS}"
+                    return 0
+                fi
+            fi
+            
+            printf '\n'
+            printf '  %bWARNING%b\n' "$Y" "$RS"
+            printf '  %bThis will overwrite the existing license and restart services.%b\n' "$D" "$RS"
+            printf '  %bA backup will be created at /var/tmp/bigip.license.backup.*%b\n' "$D" "$RS"
+            printf '\n'
+            printf '  Proceed? [y/N]: '
+            local proceed
+            read -r proceed
+            
+            if [[ ! "$proceed" =~ ^[Yy]$ ]]; then
+                msg "  ${D}Cancelled${RS}"
+                return 0
+            fi
+            
+            printf '\n'
+            if _upload_license_file "$ip" "$license_file"; then
+                log_event "LICENSE_APPLIED $ip (file: $license_file)"
+                printf '\n'
+                msg_info "Waiting for services to restart..."
+                verify_with_retry "$ip" 120
+            else
+                msg_err "Failed to apply license"
+                return 1
+            fi
+            ;;
+            
+        [Ss]|"")
+            # Skip
+            printf '\n'
+            printf '  %bNEXT STEPS (Manual)%b\n' "$BD" "$RS"
+            printf '  %b1. Copy the dossier from above (or from: %s)%b\n' "$D" "$dossier_file" "$RS"
+            printf '  %b2. Go to: %bhttps://activate.f5.com/license/dossier.jsp%b\n' "$D" "$BD" "$RS"
+            printf '  %b3. Paste the dossier and click Next%b\n' "$D" "$RS"
+            printf '  %b4. Download or copy the license%b\n' "$D" "$RS"
+            printf '  %b5. Upload to device: %bscp license.txt %s@%s:/config/bigip.license%b\n' "$D" "$BD" "$F5_USER" "$ip" "$RS"
+            printf '  %b6. Reload license: %breload %s%b\n' "$D" "$BD" "$ip" "$RS"
+            printf '\n'
+            ;;
+            
+        *)
+            msg_warn "Invalid choice. To apply license later, use: reload $ip"
+            ;;
+    esac
 }
 
 #-------------------------------------------------------------------------------
@@ -1750,6 +2354,7 @@ run_command() {
         renew)              cmd_renew "$arg1" "$arg2" ;;
         reload)             cmd_reload "$arg1" ;;
         dossier)            cmd_dossier "$arg1" "$arg2" ;;
+        apply-license|apply) cmd_apply_license "$arg1" "$arg2" ;;
         activate)           cmd_activate "$arg1" ;;
         export)             cmd_export ;;
         history|h)          cmd_history ;;
