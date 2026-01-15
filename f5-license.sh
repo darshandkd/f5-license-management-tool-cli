@@ -22,7 +22,7 @@
 set -o pipefail 2>/dev/null || true
 
 # Script metadata
-readonly F5LM_VERSION="3.3.0"
+readonly F5LM_VERSION="3.8.6"
 readonly F5LM_NAME="F5 License Manager"
 
 # Exit codes
@@ -441,21 +441,46 @@ db_get() {
 
 db_add() {
     local ip="$1"
+    local auth_type="${2:-}"  # "key" or "password"
     local ts
     ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null) || ts=$(date '+%Y-%m-%dT%H:%M:%SZ')
     
     local tmp
     tmp=$(make_temp_file "f5lm_db") || return 1
     
-    if jq --arg ip "$ip" --arg ts "$ts" \
+    if jq --arg ip "$ip" --arg ts "$ts" --arg auth "${auth_type:-}" \
         'if type == "array" then . else [] end | 
-         . + [{"ip":$ip,"added":$ts,"checked":null,"expires":null,"days":null,"status":"new","regkey":null}]' \
+         . + [{"ip":$ip,"added":$ts,"checked":null,"expires":null,"days":null,"status":"new","regkey":null,"auth_type":$auth}]' \
         "$DB_FILE" > "$tmp" 2>/dev/null; then
         mv "$tmp" "$DB_FILE" && log_event "ADDED $ip" && return 0
     fi
     
     rm -f "$tmp" 2>/dev/null
     return 1
+}
+
+# Update device auth settings
+db_update_auth() {
+    local ip="$1"
+    local auth_type="$2"
+    
+    local tmp
+    tmp=$(make_temp_file "f5lm_db") || return 1
+    
+    if jq --arg ip "$ip" --arg auth "$auth_type" \
+        '(.[] | select(.ip == $ip)) |= . + {auth_type:$auth}' \
+        "$DB_FILE" > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$DB_FILE" && return 0
+    fi
+    
+    rm -f "$tmp" 2>/dev/null
+    return 1
+}
+
+# Get device auth type
+db_get_auth_type() {
+    local ip="$1"
+    jq -r --arg ip "$ip" '.[] | select(.ip == $ip) | .auth_type // ""' "$DB_FILE" 2>/dev/null
 }
 
 db_update() {
@@ -494,12 +519,103 @@ db_remove() {
 #-------------------------------------------------------------------------------
 # CREDENTIAL HANDLING
 #-------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+# PER-DEVICE CREDENTIAL MANAGEMENT
+#-------------------------------------------------------------------------------
+# Supports per-device credentials via environment variables:
+#   F5_USER_<IP_WITH_UNDERSCORES>=username
+#   F5_PASS_<IP_WITH_UNDERSCORES>=password
+#   F5_SSH_KEY_<IP_WITH_UNDERSCORES>=path/to/key
+#
+# Falls back to global: F5_USER, F5_PASS, F5_SSH_KEY
+# Then prompts interactively if not found
+
+# Convert IP to env var suffix (replace . and : with _)
+_ip_to_env_suffix() {
+    local ip="$1"
+    echo "${ip//[.:]/_}"
+}
+
+# Get credential for a specific device (checks per-device, then global, then returns empty)
+_get_device_credential() {
+    local ip="$1"
+    local var_name="$2"  # USER, PASS, or SSH_KEY
+    
+    local suffix
+    suffix=$(_ip_to_env_suffix "$ip")
+    
+    # Check per-device variable first (from actual environment)
+    local per_device_var="F5_${var_name}_${suffix}"
+    local value
+    value=$(printenv "$per_device_var" 2>/dev/null)
+    
+    if [[ -n "$value" ]]; then
+        echo "$value"
+        return 0
+    fi
+    
+    # Fall back to global variable (from actual environment)
+    local global_var="F5_${var_name}"
+    value=$(printenv "$global_var" 2>/dev/null)
+    
+    if [[ -n "$value" ]]; then
+        echo "$value"
+        return 0
+    fi
+    
+    return 1
+}
+
+# Load credentials for a specific device into F5_USER, F5_PASS, F5_SSH_KEY
+# Returns 0 if credentials found (from env), 1 if need to prompt
+# Only checks actual environment variables, not current shell variables
+load_device_credentials() {
+    local ip="$1"
+    
+    # Try to get per-device or global credentials from actual env vars only
+    local env_user env_pass env_key
+    env_user=$(_get_device_credential "$ip" "USER")
+    env_pass=$(_get_device_credential "$ip" "PASS")
+    env_key=$(_get_device_credential "$ip" "SSH_KEY")
+    
+    # Check if we found credentials in environment
+    if [[ -n "$env_user" ]]; then
+        F5_USER="$env_user"
+        F5_PASS="$env_pass"
+        F5_SSH_KEY="$env_key"
+        return 0
+    fi
+    
+    # No credentials found in environment
+    return 1
+}
+
+# Check if device has credentials configured (env vars only)
+has_device_credentials() {
+    local ip="$1"
+    local user
+    user=$(_get_device_credential "$ip" "USER")
+    [[ -n "$user" ]]
+}
+
 prompt_credentials() {
     local context="${1:-}"
+    local ip="${context:-}"
     
-    # Already have credentials from environment
-    if [[ -n "$F5_USER" && -n "$F5_PASS" ]]; then
+    # Clear any stale credentials from previous operations
+    F5_USER=""
+    F5_PASS=""
+    F5_SSH_KEY=""
+    
+    # Try to load credentials from env vars first
+    if [[ -n "$ip" ]] && load_device_credentials "$ip"; then
         return 0
+    fi
+    
+    # Get stored auth type for this device
+    local db_auth_type=""
+    if [[ -n "$ip" ]]; then
+        db_auth_type=$(db_get_auth_type "$ip")
     fi
     
     printf '\n'
@@ -507,23 +623,82 @@ prompt_credentials() {
     if [[ -n "$context" ]]; then
         msg "  ${D}For: ${context}${RS}"
     fi
-    msg "  ${D}(credentials are never stored)${RS}"
+    
+    # Show auth type if stored
+    if [[ "$db_auth_type" == "key" ]]; then
+        msg "  ${D}Auth: SSH Key${RS}"
+    elif [[ "$db_auth_type" == "password" ]]; then
+        msg "  ${D}Auth: Password${RS}"
+    fi
     printf '\n'
     
-    # Read username
+    # Always prompt for username
     printf '  Username: '
     read -r F5_USER
     
-    # Read password with hidden input
-    printf '  Password: '
-    # Use -s flag for silent input (works on bash 3.2+)
-    read -rs F5_PASS
-    printf '\n\n'
-    
-    if [[ -z "$F5_USER" || -z "$F5_PASS" ]]; then
-        msg_err "Credentials required"
+    if [[ -z "$F5_USER" ]]; then
+        msg_err "Username required"
         return 1
     fi
+    
+    # If stored auth type is key, prompt for key path
+    if [[ "$db_auth_type" == "key" ]]; then
+        F5_PASS=""
+        local default_key="$HOME/.ssh/id_rsa"
+        printf '  SSH Key [%s]: ' "$default_key"
+        read -r F5_SSH_KEY
+        [[ -z "$F5_SSH_KEY" ]] && F5_SSH_KEY="$default_key"
+        
+        # Expand ~ if present
+        F5_SSH_KEY="${F5_SSH_KEY/#\~/$HOME}"
+        
+        if [[ ! -f "$F5_SSH_KEY" ]]; then
+            msg_err "SSH key not found: $F5_SSH_KEY"
+            return 1
+        fi
+        
+        msg "  ${D}Using SSH key: $F5_SSH_KEY${RS}"
+        printf '\n'
+        return 0
+    fi
+    
+    # If stored auth type is password, prompt for password
+    if [[ "$db_auth_type" == "password" ]]; then
+        F5_SSH_KEY=""
+        printf '  Password: '
+        read -rs F5_PASS
+        printf '\n\n'
+        if [[ -z "$F5_PASS" ]]; then
+            msg_err "Password required"
+            return 1
+        fi
+        return 0
+    fi
+    
+    # No stored auth type - allow either (leave password empty for key auth)
+    msg "  ${D}(Leave password empty for SSH key authentication)${RS}"
+    printf '  Password: '
+    read -rs F5_PASS
+    printf '\n'
+    
+    if [[ -z "$F5_PASS" ]]; then
+        # Key auth - prompt for key path
+        local default_key="$HOME/.ssh/id_rsa"
+        printf '  SSH Key [%s]: ' "$default_key"
+        read -r F5_SSH_KEY
+        [[ -z "$F5_SSH_KEY" ]] && F5_SSH_KEY="$default_key"
+        
+        # Expand ~ if present
+        F5_SSH_KEY="${F5_SSH_KEY/#\~/$HOME}"
+        
+        if [[ ! -f "$F5_SSH_KEY" ]]; then
+            msg_err "SSH key not found: $F5_SSH_KEY"
+            return 1
+        fi
+        
+        msg "  ${D}Using SSH key: $F5_SSH_KEY${RS}"
+    fi
+    printf '\n'
     
     return 0
 }
@@ -582,13 +757,16 @@ parse_date_to_ts() {
 calc_days_until() {
     local expiry="$1"
     
-    # Handle special cases
-    [[ -z "$expiry" || "$expiry" == "null" ]] && printf '?' && return
+    # Handle special cases - empty or null means perpetual
+    if [[ -z "$expiry" || "$expiry" == "null" || "$expiry" == "N/A" ]]; then
+        printf 'perpetual'
+        return
+    fi
     
-    # Perpetual license
+    # Perpetual license indicators
     case "$expiry" in
-        [Pp]erpetual|[Uu]nlimited|[Nn]ever)
-            printf 'unlimited'
+        [Pp]erpetual|[Uu]nlimited|[Nn]ever|[Nn]one)
+            printf 'perpetual'
             return
             ;;
     esac
@@ -606,7 +784,11 @@ get_status_from_days() {
     local days="$1"
     
     case "$days" in
-        "?"|"unlimited"|"")
+        "perpetual"|"unlimited")
+            printf 'perpetual'
+            return
+            ;;
+        "?"|"")
             printf 'unknown'
             return
             ;;
@@ -720,27 +902,182 @@ parse_license_info() {
 }
 
 #-------------------------------------------------------------------------------
-# SSH OPERATIONS
+# SSH OPERATIONS (Key-based and Password-based authentication)
 #-------------------------------------------------------------------------------
+
+# Global SSH auth mode: "key", "password", or "auto"
+SSH_AUTH_MODE="${SSH_AUTH_MODE:-auto}"
+
+# Custom SSH key path (optional)
+F5_SSH_KEY="${F5_SSH_KEY:-}"
+
 ssh_has_sshpass() {
     command -v sshpass >/dev/null 2>&1
 }
 
+# Check if SSH key authentication is available for a host
+ssh_has_key_auth() {
+    local ip="$1"
+    local user="${F5_USER:-root}"
+    local key_opts=""
+    
+    # Add custom key if specified
+    if [[ -n "$F5_SSH_KEY" && -f "$F5_SSH_KEY" ]]; then
+        key_opts="-i $F5_SSH_KEY"
+    fi
+    
+    # Try SSH with BatchMode (fails immediately if key auth not available)
+    # Using a short timeout and checking exit status
+    ssh -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o LogLevel=ERROR \
+        -o ConnectTimeout=5 \
+        -o BatchMode=yes \
+        -o PasswordAuthentication=no \
+        $key_opts \
+        "$user@$ip" "echo ok" 2>/dev/null
+    
+    return $?
+}
+
+# Test SSH key authentication (for display/info)
+ssh_test_key_auth() {
+    local ip="$1"
+    local user="${F5_USER:-root}"
+    
+    if ssh_has_key_auth "$ip"; then
+        return 0
+    fi
+    return 1
+}
+
+# Get SSH options based on auth mode
+# Returns options as an array-safe string
+_ssh_get_opts() {
+    echo "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10"
+}
+
+# Get SSH key option if key is specified
+_ssh_get_key_opt() {
+    if [[ -n "$F5_SSH_KEY" && -f "$F5_SSH_KEY" ]]; then
+        echo "-i"
+        echo "$F5_SSH_KEY"
+    fi
+}
+
+#-------------------------------------------------------------------------------
+# SSH COMMAND WRAPPER FOR TMOS/BASH SHELL HANDLING
+#-------------------------------------------------------------------------------
+# F5 devices can drop users into either:
+#   TMOS prompt: azadmin@(bigip-v21)(cfg-sync Standalone)(Active)(/Common)(tmos)#
+#   Bash prompt: [azadmin@bigip-v21:Active:Standalone] ~ #
+#
+# Commands like tmsh, get_dossier, reloadlic need to run in bash context.
+# This wrapper ensures commands work regardless of which shell the user lands in.
+
+# SSH command for key-based authentication
+# Handles TMOS/bash shell by running command directly (F5 executes via bash anyway)
+_f5_ssh_cmd() {
+    local ip="$1"
+    local cmd="$2"
+    local timeout_sec="${3:-15}"
+    
+    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o BatchMode=yes -o PasswordAuthentication=no"
+    
+    local result=""
+    local rc=0
+    
+    if command -v timeout >/dev/null 2>&1; then
+        if [[ -n "$F5_SSH_KEY" && -f "$F5_SSH_KEY" ]]; then
+            result=$(timeout "$timeout_sec" ssh $ssh_opts -i "$F5_SSH_KEY" "$F5_USER@$ip" "$cmd" 2>&1)
+            rc=$?
+        else
+            result=$(timeout "$timeout_sec" ssh $ssh_opts "$F5_USER@$ip" "$cmd" 2>&1)
+            rc=$?
+        fi
+    else
+        if [[ -n "$F5_SSH_KEY" && -f "$F5_SSH_KEY" ]]; then
+            result=$(ssh $ssh_opts -i "$F5_SSH_KEY" "$F5_USER@$ip" "$cmd" 2>&1)
+            rc=$?
+        else
+            result=$(ssh $ssh_opts "$F5_USER@$ip" "$cmd" 2>&1)
+            rc=$?
+        fi
+    fi
+    
+    # Filter out SSH warnings/errors from result, but keep command output
+    echo "$result" | grep -v "^Warning:" | grep -v "^Permission denied"
+    return $rc
+}
+
+# SSH command for password auth (uses sshpass if available)
+_f5_ssh_cmd_pass() {
+    local ip="$1"
+    local cmd="$2"
+    local timeout_sec="${3:-15}"
+    
+    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10"
+    
+    local result=""
+    local rc=0
+    
+    if command -v timeout >/dev/null 2>&1; then
+        if ssh_has_sshpass && [[ -n "$F5_PASS" ]]; then
+            result=$(timeout "$timeout_sec" sshpass -p "$F5_PASS" ssh $ssh_opts "$F5_USER@$ip" "$cmd" 2>&1)
+            rc=$?
+        else
+            result=$(timeout "$timeout_sec" ssh $ssh_opts "$F5_USER@$ip" "$cmd" 2>&1)
+            rc=$?
+        fi
+    else
+        if ssh_has_sshpass && [[ -n "$F5_PASS" ]]; then
+            result=$(sshpass -p "$F5_PASS" ssh $ssh_opts "$F5_USER@$ip" "$cmd" 2>&1)
+            rc=$?
+        else
+            result=$(ssh $ssh_opts "$F5_USER@$ip" "$cmd" 2>&1)
+            rc=$?
+        fi
+    fi
+    
+    echo "$result" | grep -v "^Warning:" | grep -v "^Permission denied"
+    return $rc
+}
+
+# Execute SSH command with automatic auth method selection
 ssh_exec() {
     local ip="$1"
     local cmd="$2"
     local timeout="${3:-30}"
     
-    # SSH options for non-interactive use
-    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10"
+    local ssh_opts
+    ssh_opts=$(_ssh_get_opts)
     
-    if ssh_has_sshpass; then
-        # Use sshpass for password authentication
-        sshpass -p "$F5_PASS" ssh $ssh_opts -T "$F5_USER@$ip" "$cmd" 2>/dev/null
+    # Determine auth method
+    local use_key=0
+    
+    if [[ "$SSH_AUTH_MODE" == "key" ]]; then
+        use_key=1
+    elif [[ "$SSH_AUTH_MODE" == "password" ]]; then
+        use_key=0
     else
-        # Try SSH with expect-like approach using heredoc
-        # This works if SSH keys are set up, otherwise will fail
+        # Auto mode: try key first if no password provided, or test key auth
+        if [[ -z "$F5_PASS" ]] || ssh_has_key_auth "$ip" 2>/dev/null; then
+            use_key=1
+        fi
+    fi
+    
+    if [[ $use_key -eq 1 ]]; then
+        # Key-based authentication
+        ssh $ssh_opts -o BatchMode=yes -o PasswordAuthentication=no -T "$F5_USER@$ip" "$cmd" 2>/dev/null
+    elif ssh_has_sshpass && [[ -n "$F5_PASS" ]]; then
+        # Password authentication with sshpass
+        sshpass -p "$F5_PASS" ssh $ssh_opts -T "$F5_USER@$ip" "$cmd" 2>/dev/null
+    elif [[ -n "$F5_PASS" ]]; then
+        # Try without sshpass (will prompt or use key)
         ssh $ssh_opts -T "$F5_USER@$ip" "$cmd" 2>/dev/null
+    else
+        # No password, try key auth
+        ssh $ssh_opts -o BatchMode=yes -T "$F5_USER@$ip" "$cmd" 2>/dev/null
     fi
 }
 
@@ -748,8 +1085,17 @@ ssh_exec_with_pty() {
     local ip="$1"
     local cmd="$2"
     
-    # For commands that might need a PTY, use expect if available
-    if command -v expect >/dev/null 2>&1; then
+    local ssh_opts
+    ssh_opts=$(_ssh_get_opts)
+    
+    # Try key auth first
+    if [[ -z "$F5_PASS" ]] || [[ "$SSH_AUTH_MODE" == "key" ]]; then
+        ssh $ssh_opts -o BatchMode=yes -tt "$F5_USER@$ip" "$cmd" 2>/dev/null
+        [[ $? -eq 0 ]] && return 0
+    fi
+    
+    # Fall back to password auth
+    if command -v expect >/dev/null 2>&1 && [[ -n "$F5_PASS" ]]; then
         expect -c "
             log_user 0
             set timeout 30
@@ -768,8 +1114,8 @@ ssh_exec_with_pty() {
             log_user 1
             puts \$expect_out(buffer)
         " 2>/dev/null
-    elif ssh_has_sshpass; then
-        sshpass -p "$F5_PASS" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -tt "$F5_USER@$ip" "$cmd" 2>/dev/null
+    elif ssh_has_sshpass && [[ -n "$F5_PASS" ]]; then
+        sshpass -p "$F5_PASS" ssh $ssh_opts -tt "$F5_USER@$ip" "$cmd" 2>/dev/null
     else
         return 1
     fi
@@ -873,7 +1219,7 @@ show_devices() {
     local i=0
     while [[ "$i" -lt "$count" ]]; do
         local ip expires days status
-        local status_sym status_color
+        local status_sym status_color days_display
         
         ip=$(jq -r ".[$i].ip // \"\"" "$DB_FILE" 2>/dev/null)
         expires=$(jq -r ".[$i].expires // \"-\"" "$DB_FILE" 2>/dev/null)
@@ -887,14 +1233,15 @@ show_devices() {
         
         # Status formatting
         case "$status" in
-            active)   status_sym="$SYM_OK"; status_color="$G" ;;
-            expiring) status_sym="$SYM_WARN"; status_color="$Y" ;;
-            expired)  status_sym="$SYM_ERR"; status_color="$R" ;;
-            *)        status_sym="$SYM_PENDING"; status_color="$D" ;;
+            perpetual) status_sym="$SYM_OK"; status_color="$G"; days_display="∞" ;;
+            active)    status_sym="$SYM_OK"; status_color="$G"; days_display="$days" ;;
+            expiring)  status_sym="$SYM_WARN"; status_color="$Y"; days_display="$days" ;;
+            expired)   status_sym="$SYM_ERR"; status_color="$R"; days_display="$days" ;;
+            *)         status_sym="$SYM_PENDING"; status_color="$D"; days_display="?" ;;
         esac
         
         printf '  %-3s %-18s %-14s %-10s %b%s %s%b\n' \
-            "$((i+1))" "$ip" "$expires" "$days" "$status_color" "$status_sym" "$status" "$RS"
+            "$((i+1))" "$ip" "${expires:--}" "$days_display" "$status_color" "$status_sym" "$status" "$RS"
         
         i=$((i + 1))
     done
@@ -939,56 +1286,132 @@ cmd_help() {
     printf '\n'
     printf '  %bShortcuts: a=add, r=remove, c=check, d=details, q=quit%b\n' "$D" "$RS"
     printf '\n'
+    printf '  %bEnvironment Variables%b\n' "$C" "$RS"
+    printf '    %bF5_USER%b               SSH/API username\n' "$BD" "$RS"
+    printf '    %bF5_PASS%b               SSH/API password (omit for key auth)\n' "$BD" "$RS"
+    printf '    %bF5_SSH_KEY%b            Path to SSH private key\n' "$BD" "$RS"
+    printf '    %bSSH_AUTH_MODE%b         Force auth: key, password, or auto\n' "$BD" "$RS"
+    printf '\n'
+    printf '  %bPer-Device Credentials%b (format: VAR_<IP_WITH_UNDERSCORES>)\n' "$C" "$RS"
+    printf '    %bF5_USER_10_0_0_1%b      Username for 10.0.0.1\n' "$BD" "$RS"
+    printf '    %bF5_PASS_10_0_0_1%b      Password for 10.0.0.1\n' "$BD" "$RS"
+    printf '    %bF5_SSH_KEY_10_0_0_1%b   SSH key for 10.0.0.1\n' "$BD" "$RS"
+    printf '\n'
 }
 
 #-------------------------------------------------------------------------------
 # COMMANDS: ADD
 #-------------------------------------------------------------------------------
 
+# Get license info via SSH (for key-based auth)
+# Uses direct SSH commands - handles both TMOS and bash shell prompts
+# For TMOS: tmsh commands work directly
+# For Bash: tmsh commands also work directly
+_get_license_via_ssh() {
+    local ip="$1"
+    
+    # Try tmsh command first (works from both TMOS and bash)
+    local lic_output
+    lic_output=$(_f5_ssh_cmd "$ip" "tmsh show sys license" 15)
+    local rc=$?
+    
+    # Check if SSH succeeded
+    if [[ $rc -ne 0 ]]; then
+        return 1
+    fi
+    
+    # If tmsh failed (might be in bash without tmsh in path), try with full path
+    if [[ -z "$lic_output" ]] || echo "$lic_output" | grep -qi "command not found\|not found"; then
+        lic_output=$(_f5_ssh_cmd "$ip" "/usr/bin/tmsh show sys license" 15)
+    fi
+    
+    # Parse registration key
+    local regkey=""
+    regkey=$(echo "$lic_output" | grep -i "Registration Key" | awk '{print $NF}' | head -1)
+    
+    # Parse expiration date
+    local expires=""
+    expires=$(echo "$lic_output" | grep -i "Service Check Date" | awk '{print $NF}' | head -1)
+    
+    # If no expiration from tmsh, try license file directly
+    if [[ -z "$expires" ]]; then
+        local expires_output
+        expires_output=$(_f5_ssh_cmd "$ip" "grep -i 'Service check date' /config/bigip.license" 10)
+        expires=$(echo "$expires_output" | sed 's/.*[Ss]ervice [Cc]heck [Dd]ate[: ]*//' | awk '{print $1}')
+    fi
+    
+    # Return in format: regkey|expires
+    echo "${regkey}|${expires}"
+}
+
 # Internal function to check a single device (no credential prompt)
+# Supports both REST API (password) and SSH (key) authentication
 _check_single_device() {
     local ip="$1"
     
     printf '  %-20s ' "$ip"
     
-    local auth_resp token
-    auth_resp=$(f5_auth "$ip" 10)
-    token=$(echo "$auth_resp" | jq -r '.token.token // empty' 2>/dev/null)
+    # Check if this device uses key auth
+    local db_auth_type
+    db_auth_type=$(db_get_auth_type "$ip")
     
-    if [[ -z "$token" ]]; then
-        # Determine the reason for failure
-        if [[ -z "$auth_resp" ]]; then
-            printf '%b%s unreachable%b\n' "$R" "$SYM_ERR" "$RS"
-        elif printf '%s' "$auth_resp" | grep -qi "unauthorized\|Authentication failed\|invalid.*credentials\|401"; then
-            printf '%b%s auth failed%b\n' "$R" "$SYM_ERR" "$RS"
-        else
-            printf '%b%s failed%b\n' "$R" "$SYM_ERR" "$RS"
+    local regkey="" expires=""
+    
+    if [[ "$db_auth_type" == "key" && -n "$F5_SSH_KEY" && -z "$F5_PASS" ]]; then
+        # Use SSH to get license info
+        local ssh_result
+        ssh_result=$(_get_license_via_ssh "$ip")
+        
+        if [[ -z "$ssh_result" || "$ssh_result" == "|" ]]; then
+            printf '%b%s SSH failed%b\n' "$R" "$SYM_ERR" "$RS"
+            return 1
         fi
-        return 1
+        
+        regkey="${ssh_result%%|*}"
+        expires="${ssh_result##*|}"
+    else
+        # Use REST API (password auth)
+        local auth_resp token
+        auth_resp=$(f5_auth "$ip" 10)
+        token=$(echo "$auth_resp" | jq -r '.token.token // empty' 2>/dev/null)
+        
+        if [[ -z "$token" ]]; then
+            # Determine the reason for failure
+            if [[ -z "$auth_resp" ]]; then
+                printf '%b%s unreachable%b\n' "$R" "$SYM_ERR" "$RS"
+            elif printf '%s' "$auth_resp" | grep -qi "unauthorized\|Authentication failed\|invalid.*credentials\|401"; then
+                printf '%b%s auth failed%b\n' "$R" "$SYM_ERR" "$RS"
+            else
+                printf '%b%s failed%b\n' "$R" "$SYM_ERR" "$RS"
+            fi
+            return 1
+        fi
+        
+        local lic_json parsed
+        lic_json=$(f5_get_license "$ip" "$token" 10)
+        parsed=$(parse_license_info "$lic_json")
+        regkey="${parsed%%|*}"
+        expires="${parsed##*|}"
     fi
-    
-    local lic_json parsed regkey expires days status
-    lic_json=$(f5_get_license "$ip" "$token" 10)
-    parsed=$(parse_license_info "$lic_json")
-    regkey="${parsed%%|*}"
-    expires="${parsed##*|}"
     
     if [[ -z "$expires" ]]; then
         printf '%b%s no license data%b\n' "$Y" "$SYM_WAIT" "$RS"
         return 1
     fi
     
+    local days status
     days=$(calc_days_until "$expires")
     status=$(get_status_from_days "$days")
     
     db_update "$ip" "$expires" "$days" "$status" "$regkey"
-    log_event "CHECKED $ip: $status ($days days)"
+    log_event "CHECKED $ip: $status ($days)"
     
     case "$status" in
-        active)   printf '%b%s %s days%b\n' "$G" "$SYM_OK" "$days" "$RS" ;;
-        expiring) printf '%b%s %s days%b\n' "$Y" "$SYM_WARN" "$days" "$RS" ;;
-        expired)  printf '%b%s EXPIRED%b\n' "$R" "$SYM_ERR" "$RS" ;;
-        *)        printf '%b%s unknown%b\n' "$D" "$SYM_PENDING" "$RS" ;;
+        perpetual) printf '%b%s perpetual%b\n' "$G" "$SYM_OK" "$RS" ;;
+        active)    printf '%b%s %s days%b\n' "$G" "$SYM_OK" "$days" "$RS" ;;
+        expiring)  printf '%b%s %s days%b\n' "$Y" "$SYM_WARN" "$days" "$RS" ;;
+        expired)   printf '%b%s EXPIRED%b\n' "$R" "$SYM_ERR" "$RS" ;;
+        *)         printf '%b%s unknown%b\n' "$D" "$SYM_PENDING" "$RS" ;;
     esac
     return 0
 }
@@ -1018,28 +1441,81 @@ cmd_add() {
         return 1
     fi
     
-    if db_add "$ip"; then
-        msg_ok "Added ${BD}$ip${RS}"
+    # Prompt for SSH authentication type
+    printf '\n'
+    printf '  %bSSH Authentication for %b%s%b\n' "$C" "$BD" "$ip" "$RS"
+    printf '\n'
+    printf '  %b[1]%b SSH Key (passwordless)\n' "$BD" "$RS"
+    printf '  %b[2]%b Password\n' "$BD" "$RS"
+    printf '\n'
+    printf '  Auth type [1/2]: '
+    local auth_choice
+    read -r auth_choice
+    
+    local auth_type
+    case "$auth_choice" in
+        2)
+            auth_type="password"
+            ;;
+        *)
+            auth_type="key"
+            ;;
+    esac
+    
+    printf '\n'
+    
+    if db_add "$ip" "$auth_type"; then
+        msg_ok "Added ${BD}$ip${RS} (${auth_type} auth)"
         
-        # Auto-check - prompt for credentials if not in environment
-        msg_info "Checking license status..."
+        # Prompt for credentials first
+        printf '\n'
+        printf '  Username: '
+        read -r F5_USER
         
-        if [[ -z "$F5_USER" || -z "$F5_PASS" ]]; then
-            printf '  %bEnter credentials for %b%s%b\n' "$D" "$BD" "$ip" "$RS"
-            printf '  Username: '
-            read -r F5_USER
+        if [[ -z "$F5_USER" ]]; then
+            printf '      %bRun "check %s" to fetch license info%b\n' "$D" "$ip" "$RS"
+            F5_USER="" F5_PASS="" F5_SSH_KEY=""
+            return 0
+        fi
+        
+        if [[ "$auth_type" == "key" ]]; then
+            F5_PASS=""
+            # Prompt for SSH key path
+            local default_key="$HOME/.ssh/id_rsa"
+            printf '  SSH Key [%s]: ' "$default_key"
+            read -r F5_SSH_KEY
+            [[ -z "$F5_SSH_KEY" ]] && F5_SSH_KEY="$default_key"
+            
+            # Expand ~ if present
+            F5_SSH_KEY="${F5_SSH_KEY/#\~/$HOME}"
+            
+            if [[ ! -f "$F5_SSH_KEY" ]]; then
+                msg_err "SSH key not found: $F5_SSH_KEY"
+                printf '      %bRun "check %s" to fetch license info%b\n' "$D" "$ip" "$RS"
+                F5_USER="" F5_PASS="" F5_SSH_KEY=""
+                return 0
+            fi
+            
+            msg "  ${D}Using SSH key: $F5_SSH_KEY${RS}"
+        else
             printf '  Password: '
             read -rs F5_PASS
-            printf '\n\n'
+            printf '\n'
             
-            if [[ -z "$F5_USER" || -z "$F5_PASS" ]]; then
+            if [[ -z "$F5_PASS" ]]; then
                 printf '      %bRun "check %s" to fetch license info%b\n' "$D" "$ip" "$RS"
-                F5_USER="" F5_PASS=""
+                F5_USER="" F5_PASS="" F5_SSH_KEY=""
                 return 0
             fi
         fi
         
+        # Now show checking message and perform check
+        printf '\n'
+        msg_info "Checking license status..."
         _check_single_device "$ip"
+        
+        # Clear credentials after check
+        F5_USER="" F5_PASS="" F5_SSH_KEY=""
     else
         msg_err "Failed to add $ip"
         return 1
@@ -1068,8 +1544,18 @@ cmd_add_multi() {
         
         if db_exists "$ip"; then
             msg_warn "$ip already exists"
-        elif db_add "$ip"; then
-            msg_ok "Added $ip"
+            continue
+        fi
+        
+        # Prompt for auth type only
+        printf '    Auth [1=key, 2=password]: '
+        local auth_choice
+        read -r auth_choice
+        local auth_type="key"
+        [[ "$auth_choice" == "2" ]] && auth_type="password"
+        
+        if db_add "$ip" "$auth_type"; then
+            msg_ok "Added $ip ($auth_type auth)"
             added_ips="$added_ips $ip"
             count=$((count + 1))
         else
@@ -1092,22 +1578,47 @@ cmd_add_multi() {
     printf '\n'
     
     local ok=0 fail=0 skipped=0
-    local current_user="" current_pass=""
+    local current_user="" current_pass="" current_key=""
     
     for ip in $added_ips; do
-        # Prompt for credentials for this device (unless we have env vars)
-        if [[ -n "$F5_USER" && -n "$F5_PASS" ]]; then
-            current_user="$F5_USER"
-            current_pass="$F5_PASS"
-        else
-            printf '  %bEnter credentials for %b%s%b\n' "$D" "$BD" "$ip" "$RS"
-            printf '  Username: '
-            read -r current_user
-            printf '  Password: '
-            read -rs current_pass
-            printf '\n\n'
+        local db_auth_type
+        db_auth_type=$(db_get_auth_type "$ip")
+        
+        # Always prompt for username
+        printf '  %bCredentials for %s (%s auth)%b\n' "$D" "$ip" "$db_auth_type" "$RS"
+        printf '    Username: '
+        read -r current_user
+        
+        if [[ -z "$current_user" ]]; then
+            printf '  %-20s %b%s skipped%b\n' "$ip" "$Y" "$SYM_WAIT" "$RS"
+            skipped=$((skipped + 1))
+            continue
+        fi
+        
+        if [[ "$db_auth_type" == "key" ]]; then
+            current_pass=""
+            local default_key="$HOME/.ssh/id_rsa"
+            printf '    SSH Key [%s]: ' "$default_key"
+            read -r current_key
+            [[ -z "$current_key" ]] && current_key="$default_key"
             
-            if [[ -z "$current_user" || -z "$current_pass" ]]; then
+            # Expand ~ if present
+            current_key="${current_key/#\~/$HOME}"
+            
+            if [[ ! -f "$current_key" ]]; then
+                msg_err "SSH key not found: $current_key"
+                printf '  %-20s %b%s skipped%b\n' "$ip" "$Y" "$SYM_WAIT" "$RS"
+                skipped=$((skipped + 1))
+                continue
+            fi
+            msg "    ${D}Using SSH key: $current_key${RS}"
+        else
+            current_key=""
+            printf '    Password: '
+            read -rs current_pass
+            printf '\n'
+            
+            if [[ -z "$current_pass" ]]; then
                 printf '  %-20s %b%s skipped%b\n' "$ip" "$Y" "$SYM_WAIT" "$RS"
                 skipped=$((skipped + 1))
                 continue
@@ -1117,9 +1628,10 @@ cmd_add_multi() {
         printf '  %-20s ' "$ip"
         
         # Temporarily set credentials for API calls
-        local saved_user="$F5_USER" saved_pass="$F5_PASS"
+        local saved_user="$F5_USER" saved_pass="$F5_PASS" saved_key="$F5_SSH_KEY"
         F5_USER="$current_user"
         F5_PASS="$current_pass"
+        F5_SSH_KEY="$current_key"
         
         local auth_resp token
         auth_resp=$(f5_auth "$ip" 10)
@@ -1137,6 +1649,7 @@ cmd_add_multi() {
             fail=$((fail + 1))
             F5_USER="$saved_user"
             F5_PASS="$saved_pass"
+            F5_SSH_KEY="$saved_key"
             continue
         fi
         
@@ -1149,6 +1662,7 @@ cmd_add_multi() {
         # Restore credentials
         F5_USER="$saved_user"
         F5_PASS="$saved_pass"
+        F5_SSH_KEY="$saved_key"
         
         if [[ -z "$expires" ]]; then
             printf '%b%s no license data%b\n' "$Y" "$SYM_WAIT" "$RS"
@@ -1160,13 +1674,14 @@ cmd_add_multi() {
         status=$(get_status_from_days "$days")
         
         db_update "$ip" "$expires" "$days" "$status" "$regkey"
-        log_event "CHECKED $ip: $status ($days days)"
+        log_event "CHECKED $ip: $status ($days)"
         
         case "$status" in
-            active)   printf '%b%s %s days%b\n' "$G" "$SYM_OK" "$days" "$RS" ;;
-            expiring) printf '%b%s %s days%b\n' "$Y" "$SYM_WARN" "$days" "$RS" ;;
-            expired)  printf '%b%s EXPIRED%b\n' "$R" "$SYM_ERR" "$RS" ;;
-            *)        printf '%b%s unknown%b\n' "$D" "$SYM_PENDING" "$RS" ;;
+            perpetual) printf '%b%s perpetual%b\n' "$G" "$SYM_OK" "$RS" ;;
+            active)    printf '%b%s %s days%b\n' "$G" "$SYM_OK" "$days" "$RS" ;;
+            expiring)  printf '%b%s %s days%b\n' "$Y" "$SYM_WARN" "$days" "$RS" ;;
+            expired)   printf '%b%s EXPIRED%b\n' "$R" "$SYM_ERR" "$RS" ;;
+            *)         printf '%b%s unknown%b\n' "$D" "$SYM_PENDING" "$RS" ;;
         esac
         ok=$((ok + 1))
     done
@@ -1240,7 +1755,7 @@ cmd_check() {
     
     local ok=0 fail=0 restarting=0 skipped=0
     local ip
-    local current_user="" current_pass=""
+    local current_user="" current_pass="" current_key=""
     
     # Convert to array to avoid subshell issues with read
     local ip_array=()
@@ -1252,81 +1767,138 @@ cmd_check() {
     for ip in "${ip_array[@]}"; do
         [[ -z "$ip" ]] && continue
         
-        # Prompt for credentials for this device (unless we have env vars)
-        if [[ -n "$F5_USER" && -n "$F5_PASS" ]]; then
-            # Use environment credentials
+        # Get stored auth type
+        local db_auth_type
+        db_auth_type=$(db_get_auth_type "$ip")
+        
+        # Try to load per-device credentials first
+        if load_device_credentials "$ip"; then
+            # Got credentials from environment (per-device or global)
             current_user="$F5_USER"
             current_pass="$F5_PASS"
+            current_key="$F5_SSH_KEY"
         else
             # Prompt for this specific device - read from /dev/tty
-            printf '  %bEnter credentials for %b%s%b\n' "$D" "$BD" "$ip" "$RS"
+            printf '  %bCredentials for %s (%s auth)%b\n' "$D" "$ip" "${db_auth_type:-password}" "$RS"
             printf '  Username: '
             read -r current_user </dev/tty
-            printf '  Password: '
-            read -rs current_pass </dev/tty
-            printf '\n\n'
             
-            if [[ -z "$current_user" || -z "$current_pass" ]]; then
+            if [[ -z "$current_user" ]]; then
                 printf '  %-20s %b%s skipped%b %b(no credentials)%b\n' \
                     "$ip" "$Y" "$SYM_WAIT" "$RS" "$D" "$RS"
                 skipped=$((skipped + 1))
                 continue
+            fi
+            
+            if [[ "$db_auth_type" == "key" ]]; then
+                current_pass=""
+                local default_key="$HOME/.ssh/id_rsa"
+                printf '  SSH Key [%s]: ' "$default_key" 
+                read -r current_key </dev/tty
+                [[ -z "$current_key" ]] && current_key="$default_key"
+                current_key="${current_key/#\~/$HOME}"
+                
+                if [[ ! -f "$current_key" ]]; then
+                    printf '  %b[ERROR] SSH key not found: %s%b\n' "$R" "$current_key" "$RS"
+                    printf '  %-20s %b%s skipped%b\n' "$ip" "$Y" "$SYM_WAIT" "$RS"
+                    skipped=$((skipped + 1))
+                    continue
+                fi
+                printf '  %bUsing SSH key: %s%b\n' "$D" "$current_key" "$RS"
+            else
+                printf '  Password: '
+                read -rs current_pass </dev/tty
+                printf '\n'
+                
+                if [[ -z "$current_pass" ]]; then
+                    printf '  %-20s %b%s skipped%b %b(no password)%b\n' \
+                        "$ip" "$Y" "$SYM_WAIT" "$RS" "$D" "$RS"
+                    skipped=$((skipped + 1))
+                    continue
+                fi
+                current_key=""
             fi
         fi
         
         printf '  %-20s ' "$ip"
         
         # Temporarily set credentials for API calls
-        local saved_user="$F5_USER" saved_pass="$F5_PASS"
+        local saved_user="$F5_USER" saved_pass="$F5_PASS" saved_key="$F5_SSH_KEY"
         F5_USER="$current_user"
         F5_PASS="$current_pass"
+        F5_SSH_KEY="$current_key"
         
-        local auth_resp token auth_error
-        auth_resp=$(f5_auth "$ip" 15)
-        token=$(printf '%s' "$auth_resp" | jq -r '.token.token // empty' 2>/dev/null)
+        local regkey="" expires=""
         
-        if [[ -z "$token" ]]; then
-            # Determine the reason for failure
-            if [[ -z "$auth_resp" ]]; then
-                # Empty response = connection failure / unreachable
-                printf '%b%s unreachable%b %b(connection failed)%b\n' \
+        # Use SSH for key auth, REST API for password auth
+        if [[ "$db_auth_type" == "key" && -n "$current_key" && -z "$current_pass" ]]; then
+            # Use SSH to get license info
+            local ssh_result
+            ssh_result=$(_get_license_via_ssh "$ip")
+            
+            if [[ -z "$ssh_result" || "$ssh_result" == "|" ]]; then
+                printf '%b%s SSH failed%b %b(check key permissions)%b\n' \
                     "$R" "$SYM_ERR" "$RS" "$D" "$RS"
-            elif printf '%s' "$auth_resp" | grep -qi "unauthorized\|Authentication failed\|invalid.*credentials\|401"; then
-                # Auth failure - wrong username/password
-                printf '%b%s auth failed%b %b(invalid credentials)%b\n' \
-                    "$R" "$SYM_ERR" "$RS" "$D" "$RS"
-            elif printf '%s' "$auth_resp" | grep -qi "service unavailable\|503\|connection refused"; then
-                # Service unavailable - device may be restarting
-                printf '%b%s restarting%b %b(services may be reloading)%b\n' \
-                    "$Y" "$SYM_WAIT" "$RS" "$D" "$RS"
-                restarting=$((restarting + 1))
-            else
-                # Unknown error - show generic message
-                auth_error=$(printf '%s' "$auth_resp" | jq -r '.message // .error // empty' 2>/dev/null)
-                if [[ -n "$auth_error" ]]; then
-                    printf '%b%s failed%b %b(%s)%b\n' \
-                        "$R" "$SYM_ERR" "$RS" "$D" "$auth_error" "$RS"
-                else
-                    printf '%b%s failed%b %b(unknown error)%b\n' \
-                        "$R" "$SYM_ERR" "$RS" "$D" "$RS"
-                fi
+                fail=$((fail + 1))
+                F5_USER="$saved_user"
+                F5_PASS="$saved_pass"
+                F5_SSH_KEY="$saved_key"
+                continue
             fi
-            fail=$((fail + 1))
-            # Restore credentials
-            F5_USER="$saved_user"
-            F5_PASS="$saved_pass"
-            continue
+            
+            regkey="${ssh_result%%|*}"
+            expires="${ssh_result##*|}"
+        else
+            # Use REST API (password auth)
+            local auth_resp token auth_error
+            auth_resp=$(f5_auth "$ip" 15)
+            token=$(printf '%s' "$auth_resp" | jq -r '.token.token // empty' 2>/dev/null)
+            
+            if [[ -z "$token" ]]; then
+                # Determine the reason for failure
+                if [[ -z "$auth_resp" ]]; then
+                    # Empty response = connection failure / unreachable
+                    printf '%b%s unreachable%b %b(connection failed)%b\n' \
+                        "$R" "$SYM_ERR" "$RS" "$D" "$RS"
+                elif printf '%s' "$auth_resp" | grep -qi "unauthorized\|Authentication failed\|invalid.*credentials\|401"; then
+                    # Auth failure - wrong username/password
+                    printf '%b%s auth failed%b %b(invalid credentials)%b\n' \
+                        "$R" "$SYM_ERR" "$RS" "$D" "$RS"
+                elif printf '%s' "$auth_resp" | grep -qi "service unavailable\|503\|connection refused"; then
+                    # Service unavailable - device may be restarting
+                    printf '%b%s restarting%b %b(services may be reloading)%b\n' \
+                        "$Y" "$SYM_WAIT" "$RS" "$D" "$RS"
+                    restarting=$((restarting + 1))
+                else
+                    # Unknown error - show generic message
+                    auth_error=$(printf '%s' "$auth_resp" | jq -r '.message // .error // empty' 2>/dev/null)
+                    if [[ -n "$auth_error" ]]; then
+                        printf '%b%s failed%b %b(%s)%b\n' \
+                            "$R" "$SYM_ERR" "$RS" "$D" "$auth_error" "$RS"
+                    else
+                        printf '%b%s failed%b %b(unknown error)%b\n' \
+                            "$R" "$SYM_ERR" "$RS" "$D" "$RS"
+                    fi
+                fi
+                fail=$((fail + 1))
+                # Restore credentials
+                F5_USER="$saved_user"
+                F5_PASS="$saved_pass"
+                F5_SSH_KEY="$saved_key"
+                continue
+            fi
+            
+            local lic_json parsed
+            lic_json=$(f5_get_license "$ip" "$token" 15)
+            parsed=$(parse_license_info "$lic_json")
+            regkey="${parsed%%|*}"
+            expires="${parsed##*|}"
         fi
-        
-        local lic_json parsed regkey expires days status
-        lic_json=$(f5_get_license "$ip" "$token" 15)
-        parsed=$(parse_license_info "$lic_json")
-        regkey="${parsed%%|*}"
-        expires="${parsed##*|}"
         
         # Restore credentials
         F5_USER="$saved_user"
         F5_PASS="$saved_pass"
+        F5_SSH_KEY="$saved_key"
         
         if [[ -z "$expires" ]]; then
             printf '%b%s pending%b %b(license data not ready)%b\n' \
@@ -1336,13 +1908,17 @@ cmd_check() {
             continue
         fi
         
+        local days status
         days=$(calc_days_until "$expires")
         status=$(get_status_from_days "$days")
         
         db_update "$ip" "$expires" "$days" "$status" "$regkey"
-        log_event "CHECKED $ip: $status ($days days)"
+        log_event "CHECKED $ip: $status ($days)"
         
         case "$status" in
+            perpetual)
+                printf '%b%s perpetual%b %b(no expiration)%b\n' "$G" "$SYM_OK" "$RS" "$D" "$RS"
+                ;;
             active)
                 printf '%b%s %s days%b %b(exp: %s)%b\n' "$G" "$SYM_OK" "$days" "$RS" "$D" "$expires" "$RS"
                 ;;
@@ -1380,49 +1956,69 @@ verify_with_retry() {
     
     printf '  %bWaiting for device (up to %ds)...%b\n' "$D" "$max_wait" "$RS"
     
+    # Check auth type
+    local db_auth_type
+    db_auth_type=$(db_get_auth_type "$ip")
+    
     while [[ $elapsed -lt $max_wait ]]; do
         printf '\r  %bChecking... (%ds/%ds)%b   ' "$C" "$elapsed" "$max_wait" "$RS"
         
-        local auth_resp token
-        auth_resp=$(f5_auth "$ip" 10 2>/dev/null)
-        token=$(printf '%s' "$auth_resp" | jq -r '.token.token // empty' 2>/dev/null)
+        local expires="" regkey=""
         
-        if [[ -n "$token" ]]; then
-            local lic_json parsed expires
-            lic_json=$(f5_get_license "$ip" "$token" 10 2>/dev/null)
-            parsed=$(parse_license_info "$lic_json")
-            expires="${parsed##*|}"
-            
-            if [[ -n "$expires" ]]; then
-                printf '\r%60s\r' ""
-                msg_ok "Device is back online"
-                printf '\n'
-                
-                local regkey days status
-                regkey="${parsed%%|*}"
-                days=$(calc_days_until "$expires")
-                status=$(get_status_from_days "$days")
-                db_update "$ip" "$expires" "$days" "$status" "$regkey"
-                
-                printf '  %bLICENSE STATUS%b\n' "$BD" "$RS"
-                printf '  %-20s ' "$ip"
-                case "$status" in
-                    active)
-                        printf '%b%s %s days%b %b(exp: %s)%b\n' "$G" "$SYM_OK" "$days" "$RS" "$D" "$expires" "$RS"
-                        ;;
-                    expiring)
-                        printf '%b%s %s days%b %b(exp: %s)%b\n' "$Y" "$SYM_WARN" "$days" "$RS" "$D" "$expires" "$RS"
-                        ;;
-                    expired)
-                        printf '%b%s EXPIRED%b %b(%s)%b\n' "$R" "$SYM_ERR" "$RS" "$D" "$expires" "$RS"
-                        ;;
-                    *)
-                        printf '%b%s unknown%b\n' "$D" "$SYM_PENDING" "$RS"
-                        ;;
-                esac
-                printf '\n'
-                return 0
+        if [[ "$db_auth_type" == "key" && -n "$F5_SSH_KEY" && -z "$F5_PASS" ]]; then
+            # Use SSH for key auth
+            local ssh_result
+            ssh_result=$(_get_license_via_ssh "$ip" 2>/dev/null)
+            if [[ -n "$ssh_result" && "$ssh_result" != "|" ]]; then
+                regkey="${ssh_result%%|*}"
+                expires="${ssh_result##*|}"
             fi
+        else
+            # Use REST API
+            local auth_resp token
+            auth_resp=$(f5_auth "$ip" 10 2>/dev/null)
+            token=$(printf '%s' "$auth_resp" | jq -r '.token.token // empty' 2>/dev/null)
+            
+            if [[ -n "$token" ]]; then
+                local lic_json parsed
+                lic_json=$(f5_get_license "$ip" "$token" 10 2>/dev/null)
+                parsed=$(parse_license_info "$lic_json")
+                regkey="${parsed%%|*}"
+                expires="${parsed##*|}"
+            fi
+        fi
+        
+        if [[ -n "$expires" ]]; then
+            printf '\r%60s\r' ""
+            msg_ok "Device is back online"
+            printf '\n'
+            
+            local days status
+            days=$(calc_days_until "$expires")
+            status=$(get_status_from_days "$days")
+            db_update "$ip" "$expires" "$days" "$status" "$regkey"
+            
+            printf '  %bLICENSE STATUS%b\n' "$BD" "$RS"
+            printf '  %-20s ' "$ip"
+            case "$status" in
+                perpetual)
+                    printf '%b%s perpetual%b %b(no expiration)%b\n' "$G" "$SYM_OK" "$RS" "$D" "$RS"
+                    ;;
+                active)
+                    printf '%b%s %s days%b %b(exp: %s)%b\n' "$G" "$SYM_OK" "$days" "$RS" "$D" "$expires" "$RS"
+                    ;;
+                expiring)
+                    printf '%b%s %s days%b %b(exp: %s)%b\n' "$Y" "$SYM_WARN" "$days" "$RS" "$D" "$expires" "$RS"
+                    ;;
+                expired)
+                    printf '%b%s EXPIRED%b %b(%s)%b\n' "$R" "$SYM_ERR" "$RS" "$D" "$expires" "$RS"
+                    ;;
+                *)
+                    printf '%b%s unknown%b\n' "$D" "$SYM_PENDING" "$RS"
+                    ;;
+            esac
+            printf '\n'
+            return 0
         fi
         
         sleep "$interval"
@@ -1439,6 +2035,27 @@ verify_with_retry() {
 #-------------------------------------------------------------------------------
 # COMMANDS: DETAILS
 #-------------------------------------------------------------------------------
+# Get detailed license info via SSH
+# Works from both TMOS and bash shell prompts
+_get_license_details_via_ssh() {
+    local ip="$1"
+    
+    # tmsh works from both TMOS and bash
+    local lic_output
+    lic_output=$(_f5_ssh_cmd "$ip" "tmsh show sys license" 15)
+    
+    # If tmsh not in path, try full path
+    if [[ -z "$lic_output" ]] || echo "$lic_output" | grep -qi "command not found"; then
+        lic_output=$(_f5_ssh_cmd "$ip" "/usr/bin/tmsh show sys license" 15)
+    fi
+    
+    if [[ -z "$lic_output" ]]; then
+        return 1
+    fi
+    
+    echo "$lic_output"
+}
+
 cmd_details() {
     local ip="$1"
     
@@ -1452,50 +2069,96 @@ cmd_details() {
     printf '\n'
     msg_info "Fetching details for $ip..."
     
-    local auth_resp token
-    auth_resp=$(f5_auth "$ip")
-    token=$(printf '%s' "$auth_resp" | jq -r '.token.token // empty' 2>/dev/null)
+    # Check auth type
+    local db_auth_type
+    db_auth_type=$(db_get_auth_type "$ip")
     
-    if [[ -z "$token" ]]; then
-        msg_err "Authentication failed"
-        return 1
+    local regkey="" expires="" service="" licensed="" platform=""
+    
+    if [[ "$db_auth_type" == "key" && -n "$F5_SSH_KEY" && -z "$F5_PASS" ]]; then
+        # Use SSH to get license details
+        local lic_output
+        lic_output=$(_get_license_details_via_ssh "$ip")
+        
+        if [[ -z "$lic_output" ]]; then
+            msg_err "SSH connection failed"
+            return 1
+        fi
+        
+        # Parse tmsh output
+        regkey=$(echo "$lic_output" | grep -i "Registration Key" | awk '{print $NF}' | head -1)
+        expires=$(echo "$lic_output" | grep -i "License End Date" | awk '{print $NF}' | head -1)
+        service=$(echo "$lic_output" | grep -i "Service Check Date" | awk '{print $NF}' | head -1)
+        licensed=$(echo "$lic_output" | grep -i "Licensed On" | awk '{print $NF}' | head -1)
+        platform=$(echo "$lic_output" | grep -i "Platform ID" | awk '{print $NF}' | head -1)
+        
+        if [[ -z "$regkey" && -z "$expires" ]]; then
+            msg_err "Could not parse license from SSH output"
+            return 1
+        fi
+    else
+        # Use REST API
+        local auth_resp token
+        auth_resp=$(f5_auth "$ip")
+        token=$(printf '%s' "$auth_resp" | jq -r '.token.token // empty' 2>/dev/null)
+        
+        if [[ -z "$token" ]]; then
+            msg_err "Authentication failed"
+            return 1
+        fi
+        
+        local lic_json
+        lic_json=$(f5_get_license "$ip" "$token")
+        
+        # Parse all fields
+        local info
+        info=$(printf '%s' "$lic_json" | jq -r '
+            .entries | to_entries[] | select(.key | contains("/license/")) |
+            .value.nestedStats.entries |
+            "regkey:\(.registrationKey.description // "N/A")\nexpires:\(.licenseEndDate.description // "N/A")\nservice:\(.serviceCheckDate.description // "N/A")\nlicensed:\(.licensedOnDate.description // "N/A")\nplatform:\(.platformId.description // "N/A")"
+        ' 2>/dev/null | head -5)
+        
+        if [[ -z "$info" ]]; then
+            msg_err "Could not parse license"
+            return 1
+        fi
+        
+        # Extract fields (portable grep)
+        regkey=$(printf '%s' "$info" | grep '^regkey:' | cut -d: -f2-)
+        expires=$(printf '%s' "$info" | grep '^expires:' | cut -d: -f2-)
+        service=$(printf '%s' "$info" | grep '^service:' | cut -d: -f2-)
+        licensed=$(printf '%s' "$info" | grep '^licensed:' | cut -d: -f2-)
+        platform=$(printf '%s' "$info" | grep '^platform:' | cut -d: -f2-)
     fi
     
-    local lic_json
-    lic_json=$(f5_get_license "$ip" "$token")
-    
-    # Parse all fields
-    local info regkey expires service licensed platform days status
-    
-    info=$(printf '%s' "$lic_json" | jq -r '
-        .entries | to_entries[] | select(.key | contains("/license/")) |
-        .value.nestedStats.entries |
-        "regkey:\(.registrationKey.description // "N/A")\nexpires:\(.licenseEndDate.description // "N/A")\nservice:\(.serviceCheckDate.description // "N/A")\nlicensed:\(.licensedOnDate.description // "N/A")\nplatform:\(.platformId.description // "N/A")"
-    ' 2>/dev/null | head -5)
-    
-    if [[ -z "$info" ]]; then
-        msg_err "Could not parse license"
-        return 1
-    fi
-    
-    # Extract fields (portable grep)
-    regkey=$(printf '%s' "$info" | grep '^regkey:' | cut -d: -f2-)
-    expires=$(printf '%s' "$info" | grep '^expires:' | cut -d: -f2-)
-    service=$(printf '%s' "$info" | grep '^service:' | cut -d: -f2-)
-    licensed=$(printf '%s' "$info" | grep '^licensed:' | cut -d: -f2-)
-    platform=$(printf '%s' "$info" | grep '^platform:' | cut -d: -f2-)
-    
+    local days status
     days=$(calc_days_until "$expires")
     status=$(get_status_from_days "$days")
     
     db_update "$ip" "$expires" "$days" "$status" "$regkey"
     
-    local status_display
+    local status_display days_display
     case "$status" in
-        active)   status_display="${G}ACTIVE${RS}" ;;
-        expiring) status_display="${Y}EXPIRING${RS}" ;;
-        expired)  status_display="${R}EXPIRED${RS}" ;;
-        *)        status_display="${D}UNKNOWN${RS}" ;;
+        perpetual)
+            status_display="${G}PERPETUAL${RS}"
+            days_display="no expiration"
+            ;;
+        active)
+            status_display="${G}ACTIVE${RS}"
+            days_display="$days days"
+            ;;
+        expiring)
+            status_display="${Y}EXPIRING${RS}"
+            days_display="$days days"
+            ;;
+        expired)
+            status_display="${R}EXPIRED${RS}"
+            days_display="$days days"
+            ;;
+        *)
+            status_display="${D}UNKNOWN${RS}"
+            days_display="?"
+            ;;
     esac
     
     printf '\n'
@@ -1503,9 +2166,9 @@ cmd_details() {
     printf '\n'
     printf '  +--------------------------------------------------------------+\n'
     printf '  | %-14s %-45s |\n' "IP:" "$ip"
-    printf '  | %-14s %-45b |\n' "Status:" "$status_display ($days days)"
+    printf '  | %-14s %-45b |\n' "Status:" "$status_display ($days_display)"
     printf '  +--------------------------------------------------------------+\n'
-    printf '  | %-14s %-45s |\n' "Expires:" "${expires:-N/A}"
+    printf '  | %-14s %-45s |\n' "Expires:" "${expires:-Perpetual}"
     printf '  | %-14s %-45s |\n' "Service Date:" "${service:-N/A}"
     printf '  | %-14s %-45s |\n' "Licensed On:" "${licensed:-N/A}"
     printf '  | %-14s %-45s |\n' "Platform:" "${platform:-N/A}"
@@ -1552,28 +2215,55 @@ cmd_renew() {
     printf '\n'
     msg_info "Connecting to $ip..."
     
-    local auth_resp token
-    auth_resp=$(f5_auth "$ip")
-    token=$(printf '%s' "$auth_resp" | jq -r '.token.token // empty' 2>/dev/null)
+    # Check auth type
+    local db_auth_type
+    db_auth_type=$(db_get_auth_type "$ip")
     
-    if [[ -z "$token" ]]; then
-        msg_err "Authentication failed"
-        return 1
+    if [[ "$db_auth_type" == "key" && -n "$F5_SSH_KEY" && -z "$F5_PASS" ]]; then
+        # For SSH key auth, use SOAPLicenseClient via SSH
+        msg_info "Installing license via SSH..."
+        
+        # SOAPLicenseClient is a bash command
+        local result
+        result=$(_f5_ssh_cmd "$ip" "SOAPLicenseClient --basekey $regkey" 30)
+        
+        # If that failed (might be in TMOS), try via bash explicitly
+        if [[ -z "$result" ]] || echo "$result" | grep -qi "syntax error\|unknown"; then
+            result=$(_f5_ssh_cmd "$ip" "bash -c 'SOAPLicenseClient --basekey $regkey'" 30)
+        fi
+        
+        if echo "$result" | grep -qi "error\|fail"; then
+            msg_err "Failed to install license: $result"
+            return 1
+        fi
+        
+        msg_ok "License installed!"
+    else
+        # Use REST API for password auth
+        local auth_resp token
+        auth_resp=$(f5_auth "$ip")
+        token=$(printf '%s' "$auth_resp" | jq -r '.token.token // empty' 2>/dev/null)
+        
+        if [[ -z "$token" ]]; then
+            msg_err "Authentication failed"
+            return 1
+        fi
+        
+        msg_info "Installing license..."
+        
+        local result
+        result=$(f5_install_license "$ip" "$token" "$regkey")
+        
+        if printf '%s' "$result" | jq -e '.code' >/dev/null 2>&1; then
+            local errmsg
+            errmsg=$(printf '%s' "$result" | jq -r '.message // "Unknown error"')
+            msg_err "Failed: $errmsg"
+            return 1
+        fi
+        
+        msg_ok "License installed!"
     fi
     
-    msg_info "Installing license..."
-    
-    local result
-    result=$(f5_install_license "$ip" "$token" "$regkey")
-    
-    if printf '%s' "$result" | jq -e '.code' >/dev/null 2>&1; then
-        local errmsg
-        errmsg=$(printf '%s' "$result" | jq -r '.message // "Unknown error"')
-        msg_err "Failed: $errmsg"
-        return 1
-    fi
-    
-    msg_ok "License installed!"
     log_event "RENEWED $ip with ${regkey:0:10}..."
     
     printf '\n'
@@ -1611,13 +2301,32 @@ cmd_reload() {
     printf '\n'
     msg_info "Reloading license on $ip..."
     
-    if ! ssh_has_sshpass; then
-        msg_warn "sshpass not installed - SSH may prompt for password"
-    fi
-    
     local result rc
-    result=$(f5_ssh_bash "$ip" "reloadlic" 2>&1)
-    rc=$?
+    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15"
+    
+    if [[ -z "$F5_PASS" ]]; then
+        # Key-based authentication
+        msg "  ${D}Using SSH key authentication${RS}"
+        if [[ -n "$F5_SSH_KEY" && -f "$F5_SSH_KEY" ]]; then
+            result=$(ssh $ssh_opts -o BatchMode=yes -o PasswordAuthentication=no -i "$F5_SSH_KEY" "$F5_USER@$ip" "reloadlic" 2>&1)
+        else
+            result=$(ssh $ssh_opts -o BatchMode=yes -o PasswordAuthentication=no "$F5_USER@$ip" "reloadlic" 2>&1)
+        fi
+        rc=$?
+    elif ssh_has_sshpass; then
+        # Password authentication with sshpass (non-interactive)
+        msg "  ${D}Using password authentication${RS}"
+        result=$(sshpass -p "$F5_PASS" ssh $ssh_opts "$F5_USER@$ip" "reloadlic" 2>&1)
+        rc=$?
+    else
+        # Password authentication without sshpass - run interactively
+        msg "  ${D}Using password authentication (interactive)${RS}"
+        msg "  ${D}You will be prompted for the password...${RS}"
+        printf '\n'
+        ssh $ssh_opts "$F5_USER@$ip" "reloadlic"
+        rc=$?
+        result=""
+    fi
     
     if [[ $rc -eq 0 ]]; then
         msg_ok "License reload initiated"
@@ -1760,30 +2469,57 @@ cmd_apply_license() {
 # COMMANDS: DOSSIER (Enhanced with license application)
 #-------------------------------------------------------------------------------
 
-# SSH connection multiplexing for multiple operations with single password
+# SSH connection multiplexing for multiple operations with single auth
 # Creates a control socket for connection reuse
 _ssh_control_path() {
     local ip="$1"
     echo "/tmp/f5lm-ssh-${ip//[.:]/_}-$$"
 }
 
-# Start SSH control master connection
+# Start SSH control master connection (supports both key and password auth)
 _ssh_start_control() {
     local ip="$1"
     local control_path
     control_path=$(_ssh_control_path "$ip")
     
-    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10"
-    ssh_opts="$ssh_opts -o ControlMaster=yes -o ControlPath=$control_path -o ControlPersist=60"
+    local ssh_base_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10"
+    ssh_base_opts="$ssh_base_opts -o ControlMaster=yes -o ControlPath=$control_path -o ControlPersist=60"
     
-    # Start the control master in background
-    if ssh_has_sshpass; then
-        sshpass -p "$F5_PASS" ssh $ssh_opts -fN "$F5_USER@$ip" 2>/dev/null
-    else
-        ssh $ssh_opts -fN "$F5_USER@$ip" 2>/dev/null
+    # Determine auth method and start control master
+    # Use timeout to prevent hanging
+    local timeout_cmd=""
+    if command -v timeout >/dev/null 2>&1; then
+        timeout_cmd="timeout 15"
     fi
     
-    return $?
+    local rc=0
+    if [[ -z "$F5_PASS" ]]; then
+        # Key-based authentication (no password)
+        if [[ -n "$F5_SSH_KEY" && -f "$F5_SSH_KEY" ]]; then
+            $timeout_cmd ssh $ssh_base_opts -i "$F5_SSH_KEY" -o BatchMode=yes -o PasswordAuthentication=no -f -N "$F5_USER@$ip" 2>/dev/null
+        else
+            $timeout_cmd ssh $ssh_base_opts -o BatchMode=yes -o PasswordAuthentication=no -f -N "$F5_USER@$ip" 2>/dev/null
+        fi
+        rc=$?
+    elif ssh_has_sshpass; then
+        # Password authentication with sshpass
+        $timeout_cmd sshpass -p "$F5_PASS" ssh $ssh_base_opts -f -N "$F5_USER@$ip" 2>/dev/null
+        rc=$?
+    else
+        # Try without sshpass (will prompt interactively or use key)
+        $timeout_cmd ssh $ssh_base_opts -f -N "$F5_USER@$ip" 2>/dev/null
+        rc=$?
+    fi
+    
+    # Wait a moment for control socket to be created
+    sleep 0.5
+    
+    # Verify control socket exists
+    if [[ ! -S "$control_path" ]]; then
+        return 1
+    fi
+    
+    return $rc
 }
 
 # Stop SSH control master connection
@@ -1810,6 +2546,42 @@ _ssh_run() {
     ssh $ssh_opts "$F5_USER@$ip" "$cmd" 2>/dev/null
 }
 
+# Run SSH command with automatic shell detection (handles TMOS vs bash prompt)
+# TMOS prompt: azadmin@(bigip-v21)(pid-25079)(cfg-sync Standalone)(Active)(/Common)(tmos)#
+# Bash prompt: [azadmin@bigip-v21:Active:Standalone] ~ #
+_ssh_run_bash() {
+    local ip="$1"
+    local cmd="$2"
+    local control_path
+    control_path=$(_ssh_control_path "$ip")
+    
+    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+    ssh_opts="$ssh_opts -o ControlPath=$control_path"
+    
+    # Wrap command to handle both TMOS and bash shell
+    # Using /bin/bash -c ensures we're in bash regardless of login shell
+    # TMOS shell doesn't understand bash, but /bin/bash is the full path
+    ssh $ssh_opts "$F5_USER@$ip" "/bin/bash -c '$cmd'" 2>/dev/null
+}
+
+# Run SSH command for license operations (ensures we're in bash shell)
+# This handles the case where user lands in TMOS prompt instead of bash
+# TMOS prompt: azadmin@(bigip-v21)(cfg-sync Standalone)(Active)(/Common)(tmos)#
+# Bash prompt: [azadmin@bigip-v21:Active:Standalone] ~ #
+_ssh_run_license_cmd() {
+    local ip="$1"
+    local cmd="$2"
+    local control_path
+    control_path=$(_ssh_control_path "$ip")
+    
+    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+    ssh_opts="$ssh_opts -o ControlPath=$control_path"
+    
+    # Always wrap in /bin/bash -c to ensure we're in bash context
+    # This works whether the user lands in TMOS or bash shell
+    ssh $ssh_opts "$F5_USER@$ip" "/bin/bash -c '$cmd'" 2>/dev/null
+}
+
 # Run SCP using existing control connection
 _scp_run() {
     local ip="$1"
@@ -1831,41 +2603,98 @@ _apply_license_to_device() {
     local remote_file="/config/bigip.license"
     local backup_file="/var/tmp/bigip.license.backup.$(date +%Y%m%d_%H%M%S)"
     
-    # Start SSH control connection (single password prompt)
-    msg_info "Establishing SSH connection..."
-    if ! _ssh_start_control "$ip"; then
-        msg_err "Failed to establish SSH connection"
-        return 1
-    fi
-    
-    # Register cleanup
-    trap "_ssh_stop_control '$ip'" RETURN
-    
-    # Backup existing license
-    msg_info "Backing up existing license..."
-    _ssh_run "$ip" "cp $remote_file $backup_file 2>/dev/null || true"
-    msg "  ${D}Backup: $backup_file${RS}"
+    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15"
+    local scp_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
     
     # Create temp file with license content
     local temp_file
     temp_file=$(make_temp_file "license")
     echo "$license_content" > "$temp_file"
     
-    # Upload license
-    msg_info "Writing license to device..."
-    if ! _scp_run "$ip" "$temp_file" "$remote_file"; then
+    msg_info "Applying license to device..."
+    
+    if [[ -z "$F5_PASS" ]]; then
+        # Key-based authentication
+        msg "  ${D}Using SSH key authentication${RS}"
+        
+        local key_opt=""
+        [[ -n "$F5_SSH_KEY" && -f "$F5_SSH_KEY" ]] && key_opt="-i $F5_SSH_KEY"
+        
+        # Backup existing license
+        msg_info "Backing up existing license..."
+        ssh $ssh_opts -o BatchMode=yes -o PasswordAuthentication=no $key_opt "$F5_USER@$ip" \
+            "cp $remote_file $backup_file 2>/dev/null || true" 2>/dev/null
+        msg "  ${D}Backup: $backup_file${RS}"
+        
+        # Upload license
+        msg_info "Writing license to device..."
+        if ! scp $scp_opts -o BatchMode=yes -o PasswordAuthentication=no $key_opt "$temp_file" "$F5_USER@$ip:$remote_file" 2>/dev/null; then
+            rm -f "$temp_file" 2>/dev/null
+            msg_err "Failed to write license file"
+            return 1
+        fi
         rm -f "$temp_file" 2>/dev/null
-        msg_err "Failed to write license file"
-        return 1
+        
+        msg_ok "License written to device"
+        
+        # Reload license
+        printf '\n'
+        msg_info "Reloading license configuration..."
+        ssh $ssh_opts -o BatchMode=yes -o PasswordAuthentication=no $key_opt "$F5_USER@$ip" "reloadlic" 2>/dev/null
+        
+    elif ssh_has_sshpass; then
+        # Password authentication with sshpass
+        msg "  ${D}Using password authentication${RS}"
+        
+        # Backup existing license
+        msg_info "Backing up existing license..."
+        sshpass -p "$F5_PASS" ssh $ssh_opts "$F5_USER@$ip" \
+            "cp $remote_file $backup_file 2>/dev/null || true" 2>/dev/null
+        msg "  ${D}Backup: $backup_file${RS}"
+        
+        # Upload license
+        msg_info "Writing license to device..."
+        if ! sshpass -p "$F5_PASS" scp $scp_opts "$temp_file" "$F5_USER@$ip:$remote_file" 2>/dev/null; then
+            rm -f "$temp_file" 2>/dev/null
+            msg_err "Failed to write license file"
+            return 1
+        fi
+        rm -f "$temp_file" 2>/dev/null
+        
+        msg_ok "License written to device"
+        
+        # Reload license
+        printf '\n'
+        msg_info "Reloading license configuration..."
+        sshpass -p "$F5_PASS" ssh $ssh_opts "$F5_USER@$ip" "reloadlic" 2>/dev/null
+        
+    else
+        # Password authentication without sshpass - run interactively
+        msg "  ${D}Using password authentication (interactive)${RS}"
+        msg "  ${D}You will be prompted for the password multiple times...${RS}"
+        printf '\n'
+        
+        # Backup existing license
+        msg_info "Backing up existing license..."
+        ssh $ssh_opts "$F5_USER@$ip" "cp $remote_file $backup_file 2>/dev/null || true"
+        msg "  ${D}Backup: $backup_file${RS}"
+        
+        # Upload license
+        msg_info "Writing license to device..."
+        if ! scp $scp_opts "$temp_file" "$F5_USER@$ip:$remote_file"; then
+            rm -f "$temp_file" 2>/dev/null
+            msg_err "Failed to write license file"
+            return 1
+        fi
+        rm -f "$temp_file" 2>/dev/null
+        
+        msg_ok "License written to device"
+        
+        # Reload license
+        printf '\n'
+        msg_info "Reloading license configuration..."
+        ssh $ssh_opts "$F5_USER@$ip" "reloadlic"
     fi
-    rm -f "$temp_file" 2>/dev/null
-    
-    msg_ok "License written to device"
-    
-    # Reload license
-    printf '\n'
-    msg_info "Reloading license configuration..."
-    _ssh_run "$ip" "bash -c 'reloadlic'" 2>/dev/null
     
     if [[ $? -eq 0 ]]; then
         msg_ok "License reload initiated"
@@ -1969,111 +2798,154 @@ cmd_dossier() {
     
     msg_info "Connecting to $ip..."
     
-    local auth_resp token
-    auth_resp=$(f5_auth "$ip")
-    token=$(printf '%s' "$auth_resp" | jq -r '.token.token // empty' 2>/dev/null)
+    # Check auth type
+    local db_auth_type
+    db_auth_type=$(db_get_auth_type "$ip")
     
-    if [[ -z "$token" ]]; then
-        msg_err "Authentication failed"
-        return 1
-    fi
+    local dossier=""
     
-    # Get regkey if not provided
-    if [[ -z "$regkey" ]]; then
-        msg_info "Retrieving registration key..."
-        local lic_json
-        lic_json=$(f5_get_license "$ip" "$token")
-        regkey=$(echo "$lic_json" | jq -r '
-            .entries | to_entries[] | select(.key | contains("/license/")) |
-            .value.nestedStats.entries.registrationKey.description // empty
-        ' 2>/dev/null | head -1)
+    if [[ "$db_auth_type" == "key" && -n "$F5_SSH_KEY" && -z "$F5_PASS" ]]; then
+        # Use SSH directly for key auth
         
-        if [[ -z "$regkey" || "$regkey" == "null" ]]; then
-            msg_warn "Could not retrieve registration key from device"
-            printf '\n'
-            printf '  %bPlease provide the registration key:%b\n' "$D" "$RS"
-            printf '  Registration Key: '
-            read -r regkey
+        # Get regkey if not provided
+        if [[ -z "$regkey" ]]; then
+            msg_info "Retrieving registration key via SSH..."
+            local lic_output
+            lic_output=$(_f5_ssh_cmd "$ip" "tmsh show sys license" 15)
+            regkey=$(echo "$lic_output" | grep -i "Registration Key" | awk '{print $NF}' | head -1)
+            
             if [[ -z "$regkey" ]]; then
-                msg_err "Registration key required for dossier"
-                return 1
+                msg_warn "Could not retrieve registration key from device"
+                printf '\n'
+                printf '  %bPlease provide the registration key:%b\n' "$D" "$RS"
+                printf '  Registration Key: '
+                read -r regkey
+                if [[ -z "$regkey" ]]; then
+                    msg_err "Registration key required for dossier"
+                    return 1
+                fi
+            else
+                msg_ok "Found registration key: ${BD}$regkey${RS}"
             fi
-        else
-            msg_ok "Found registration key: ${BD}$regkey${RS}"
-        fi
-    fi
-    
-    msg_info "Generating dossier via REST API..."
-    
-    local resp dossier
-    resp=$(f5_get_dossier "$ip" "$token" "$regkey")
-    dossier=$(echo "$resp" | jq -r '.dossier // empty' 2>/dev/null)
-    
-    # If REST fails, try SSH
-    if [[ -z "$dossier" || "$dossier" == "null" ]]; then
-        local errmsg
-        errmsg=$(echo "$resp" | jq -r '.message // empty' 2>/dev/null)
-        msg_warn "REST API not available${errmsg:+ ($errmsg)}"
-        
-        msg_info "Trying SSH method..."
-        
-        # Check if sshpass is available for password auth
-        if ! ssh_has_sshpass; then
-            msg_warn "sshpass not installed - trying without password automation"
-            msg "  ${D}If SSH key auth is not set up, you may need to install sshpass:${RS}"
-            msg "  ${D}  macOS:  brew install hudochenkov/sshpass/sshpass${RS}"
-            msg "  ${D}  Ubuntu: sudo apt install sshpass${RS}"
-            msg "  ${D}  RHEL:   sudo yum install sshpass${RS}"
-            printf '\n'
         fi
         
-        # Try to get dossier via SSH
-        dossier=$(f5_ssh_dossier "$ip" "$regkey" 2>/dev/null)
+        msg_info "Generating dossier via SSH..."
         
-        # Clean up the dossier (remove any shell prompts or extra output)
-        if [[ -n "$dossier" ]]; then
-            # Extract just the dossier string (hex characters)
-            dossier=$(echo "$dossier" | grep -oE '[a-f0-9]{20,}' | head -1)
+        # Generate dossier via SSH
+        # get_dossier is a bash command, so it works from bash shell
+        # If user lands in TMOS, we need to run it via bash
+        local dossier_output
+        dossier_output=$(_f5_ssh_cmd "$ip" "get_dossier -b $regkey" 30)
+        
+        # If that failed (might be in TMOS), try via bash explicitly
+        if [[ -z "$dossier_output" ]] || echo "$dossier_output" | grep -qi "syntax error\|unknown"; then
+            dossier_output=$(_f5_ssh_cmd "$ip" "bash -c 'get_dossier -b $regkey'" 30)
+        fi
+        
+        # Extract dossier string (hex characters)
+        if [[ -n "$dossier_output" ]]; then
+            dossier=$(echo "$dossier_output" | grep -oE '[a-f0-9]{20,}' | head -1)
         fi
         
         if [[ -z "$dossier" ]]; then
             msg_err "SSH dossier generation failed"
-            printf '\n'
-            printf '  %bMANUAL DOSSIER GENERATION%b\n' "$BD" "$RS"
-            printf '\n'
-            printf '  %bSSH to the F5 device and run:%b\n' "$D" "$RS"
-            printf '\n'
-            printf '    %bssh %s@%s%b\n' "$BD" "$F5_USER" "$ip" "$RS"
-            printf '    %bbash%b  %b(if not already in bash)%b\n' "$BD" "$RS" "$D" "$RS"
-            printf '    %bget_dossier -b %s%b\n' "$BD" "$regkey" "$RS"
-            printf '\n'
-            printf '  %bThen paste the dossier at:%b\n' "$D" "$RS"
-            printf '    %bhttps://activate.f5.com/license/dossier.jsp%b\n' "$BD" "$RS"
-            printf '\n'
-            
-            # Offer to try interactive SSH
-            printf '  Try interactive SSH now? [y/N]: '
-            local try_ssh
-            read -r try_ssh
-            if [[ "$try_ssh" =~ ^[Yy]$ ]]; then
-                printf '\n'
-                msg_info "Opening SSH session to $ip..."
-                msg "  ${D}Run: get_dossier -b $regkey${RS}"
-                msg "  ${D}Then copy the output and type 'exit' to return${RS}"
-                printf '\n'
-                
-                if ssh_has_sshpass; then
-                    sshpass -p "$F5_PASS" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$F5_USER@$ip"
-                else
-                    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$F5_USER@$ip"
-                fi
-            fi
             return 1
-        else
-            msg_ok "Dossier retrieved via SSH"
         fi
+        msg_ok "Dossier generated via SSH"
     else
-        msg_ok "Dossier generated via REST API"
+        # Use REST API for password auth
+        local auth_resp token
+        auth_resp=$(f5_auth "$ip")
+        token=$(printf '%s' "$auth_resp" | jq -r '.token.token // empty' 2>/dev/null)
+        
+        if [[ -z "$token" ]]; then
+            msg_err "Authentication failed"
+            return 1
+        fi
+        
+        # Get regkey if not provided
+        if [[ -z "$regkey" ]]; then
+            msg_info "Retrieving registration key..."
+            local lic_json
+            lic_json=$(f5_get_license "$ip" "$token")
+            regkey=$(echo "$lic_json" | jq -r '
+                .entries | to_entries[] | select(.key | contains("/license/")) |
+                .value.nestedStats.entries.registrationKey.description // empty
+            ' 2>/dev/null | head -1)
+            
+            if [[ -z "$regkey" || "$regkey" == "null" ]]; then
+                msg_warn "Could not retrieve registration key from device"
+                printf '\n'
+                printf '  %bPlease provide the registration key:%b\n' "$D" "$RS"
+                printf '  Registration Key: '
+                read -r regkey
+                if [[ -z "$regkey" ]]; then
+                    msg_err "Registration key required for dossier"
+                    return 1
+                fi
+            else
+                msg_ok "Found registration key: ${BD}$regkey${RS}"
+            fi
+        fi
+        
+        msg_info "Generating dossier via REST API..."
+        
+        local resp
+        resp=$(f5_get_dossier "$ip" "$token" "$regkey")
+        dossier=$(echo "$resp" | jq -r '.dossier // empty' 2>/dev/null)
+        
+        # If REST fails, try SSH fallback
+        if [[ -z "$dossier" || "$dossier" == "null" ]]; then
+            local errmsg
+            errmsg=$(echo "$resp" | jq -r '.message // empty' 2>/dev/null)
+            msg_warn "REST API not available${errmsg:+ ($errmsg)}"
+            
+            msg_info "Trying SSH method..."
+            
+            local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15"
+            local dossier_output=""
+            
+            if [[ -z "$F5_PASS" ]]; then
+                # Key auth (should have been handled above, but fallback)
+                msg "  ${D}Using SSH key authentication${RS}"
+                local key_opt=""
+                [[ -n "$F5_SSH_KEY" && -f "$F5_SSH_KEY" ]] && key_opt="-i $F5_SSH_KEY"
+                dossier_output=$(ssh $ssh_opts -o BatchMode=yes -o PasswordAuthentication=no $key_opt "$F5_USER@$ip" "get_dossier -b $regkey" 2>/dev/null)
+            elif ssh_has_sshpass; then
+                # Password auth with sshpass
+                msg "  ${D}Using password authentication${RS}"
+                dossier_output=$(sshpass -p "$F5_PASS" ssh $ssh_opts "$F5_USER@$ip" "get_dossier -b $regkey" 2>/dev/null)
+            else
+                # Password auth without sshpass - interactive
+                msg "  ${D}Using password authentication (interactive)${RS}"
+                msg "  ${D}You will be prompted for the password...${RS}"
+                printf '\n'
+                dossier_output=$(ssh $ssh_opts "$F5_USER@$ip" "get_dossier -b $regkey" 2>&1)
+            fi
+            
+            # Extract dossier string (hex characters)
+            if [[ -n "$dossier_output" ]]; then
+                dossier=$(echo "$dossier_output" | grep -oE '[a-f0-9]{20,}' | head -1)
+            fi
+            
+            if [[ -z "$dossier" ]]; then
+                msg_err "SSH dossier generation failed"
+                printf '\n'
+                printf '  %bMANUAL DOSSIER GENERATION%b\n' "$BD" "$RS"
+                printf '\n'
+                printf '  %bSSH to the F5 device and run:%b\n' "$D" "$RS"
+                printf '\n'
+                printf '    %bssh %s@%s%b\n' "$BD" "$F5_USER" "$ip" "$RS"
+                printf '    %bbash%b  %b(if not already in bash)%b\n' "$BD" "$RS" "$D" "$RS"
+                printf '    %bget_dossier -b %s%b\n' "$BD" "$regkey" "$RS"
+                printf '\n'
+                return 1
+            else
+                msg_ok "Dossier retrieved via SSH"
+            fi
+        else
+            msg_ok "Dossier generated via REST API"
+        fi
     fi
     
     printf '\n'
@@ -2462,4 +3334,3 @@ main() {
 
 # Entry point
 main "$@"
-

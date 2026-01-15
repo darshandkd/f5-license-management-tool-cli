@@ -2,7 +2,7 @@
 
 A powerful, interactive CLI tool for F5 BIG-IP license lifecycle management. Manage licenses across multiple F5 devices from a single terminal interface.
 
-![Version](https://img.shields.io/badge/version-3.3.1-blue.svg)
+![Version](https://img.shields.io/badge/version-3.8.6-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20BSD%20%7C%20WSL-lightgrey.svg)
 ![Bash](https://img.shields.io/badge/bash-3.2%2B-green.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
@@ -16,6 +16,7 @@ A powerful, interactive CLI tool for F5 BIG-IP license lifecycle management. Man
 - 🔄 **License Renewal** - Apply new licenses via REST API with automatic verification
 - 📝 **Dossier Generation** - Generate dossiers via REST API or SSH fallback
 - 🎯 **One-Step License Application** - Paste or upload license directly from the tool
+- 🔑 **Flexible SSH Auth** - Supports both SSH key and password authentication
 - 🔐 **Secure** - Credentials never stored, used only for active session
 - 📊 **Export** - Export device inventory to CSV
 - 🌍 **Cross-Platform** - Works on Linux, macOS, FreeBSD, WSL, Cygwin
@@ -107,10 +108,120 @@ sudo mv f5lm /usr/local/bin/
 
 ---
 
+## SSH Authentication
+
+The tool supports both **SSH key-based** and **password-based** authentication for SSH operations (dossier generation, license application, reload).
+
+### Per-Device Credentials
+
+Each F5 device can have its own credentials configured via environment variables:
+
+```bash
+# Format: F5_<VARIABLE>_<IP_WITH_UNDERSCORES>
+
+# Device 1: Password authentication
+export F5_USER_192_168_1_100=admin
+export F5_PASS_192_168_1_100=password1
+
+# Device 2: SSH key authentication (no password = key auth)
+export F5_USER_10_0_0_50=root
+export F5_SSH_KEY_10_0_0_50=~/.ssh/f5_device2_key
+
+# Device 3: Different key
+export F5_USER_172_16_0_10=admin
+export F5_SSH_KEY_172_16_0_10=~/.ssh/f5_device3_key
+
+# Now run - no prompts needed!
+./f5lm check all
+```
+
+### Credential Priority
+
+For each device, credentials are resolved in this order:
+
+1. **Per-device env var** (`F5_USER_192_168_1_100`)
+2. **Global env var** (`F5_USER`) - fallback for all devices
+3. **Interactive prompt** - if nothing found
+
+### Global Credentials (Fallback)
+
+If all devices share the same credentials:
+
+```bash
+# Same credentials for all devices
+export F5_USER=admin
+export F5_PASS=shared_password
+./f5lm
+```
+
+### Key-Based Authentication
+
+Leave password empty (or don't set it) to use SSH key authentication:
+
+```bash
+# Per-device key auth
+export F5_USER_10_0_0_1=root
+# No F5_PASS_10_0_0_1 = uses SSH key
+
+# Global key auth (all devices)
+export F5_USER=root
+# No F5_PASS = uses SSH key for all
+./f5lm
+```
+
+Or interactively - just press Enter when prompted for password:
+
+```bash
+f5lm > dossier 192.168.1.100
+
+  Enter F5 Credentials
+  For: 192.168.1.100
+  (Leave password empty for SSH key authentication)
+
+  Username: root
+  Password: 
+  Using SSH key authentication
+```
+
+### Environment Variables Reference
+
+| Variable | Scope | Description |
+|----------|-------|-------------|
+| `F5_USER` | Global | Default username for all devices |
+| `F5_PASS` | Global | Default password (omit for key auth) |
+| `F5_SSH_KEY` | Global | Default SSH private key path |
+| `F5_USER_<IP>` | Per-device | Username for specific device |
+| `F5_PASS_<IP>` | Per-device | Password for specific device |
+| `F5_SSH_KEY_<IP>` | Per-device | SSH key for specific device |
+| `SSH_AUTH_MODE` | Global | Force: `key`, `password`, or `auto` |
+
+**Note:** Replace dots in IP with underscores: `10.0.0.1` → `F5_USER_10_0_0_1`
+
+### Example: Mixed Authentication
+
+```bash
+# Device 1: Password auth
+export F5_USER_192_168_1_100=admin
+export F5_PASS_192_168_1_100=pass1
+
+# Device 2: Key auth with custom key
+export F5_USER_10_0_0_50=root
+export F5_SSH_KEY_10_0_0_50=~/.ssh/f5_key
+
+# Device 3: Key auth with default key (~/.ssh/id_rsa)
+export F5_USER_172_16_0_10=root
+# No password, no custom key = default key
+
+# Check all - each device uses its own auth method
+./f5lm check all
+```
+
+---
+
 ## Interface
 
 ```
-  ███████╗███████╗   License Manager v3.3.1
+  ███████╗███████╗   License Manager v3.8.6
   ██╔════╝██╔════╝   F5 BIG-IP License Lifecycle Tool
   █████╗  ███████╗
   ██╔══╝  ╚════██║   Type help for commands
@@ -143,10 +254,47 @@ sudo mv f5lm /usr/local/bin/
 ### Device Management
 
 #### `add <ip>`
-Add a single F5 device to the inventory. **Automatically checks license status** if credentials are available.
+Add a single F5 device to the inventory. Prompts for **authentication type** (SSH key or password), which is stored for future connections. Username and SSH key path are prompted when connecting.
 
 ```bash
 f5lm > add 192.168.1.100
+
+  SSH Authentication for 192.168.1.100
+
+  [1] SSH Key (passwordless)
+  [2] Password
+
+  Auth type [1/2]: 1
+
+  [OK] Added 192.168.1.100 (key auth)
+  >>> Checking license status...
+  Username: azadmin
+  SSH Key [/home/user/.ssh/id_rsa]: ~/.ssh/f5_key
+  Using SSH key: /home/user/.ssh/f5_key
+
+  192.168.1.100        ● 152 days
+```
+
+**With password authentication:**
+```bash
+f5lm > add 10.0.0.50
+
+  SSH Authentication for 10.0.0.50
+
+  [1] SSH Key (passwordless)
+  [2] Password
+
+  Auth type [1/2]: 2
+
+  [OK] Added 10.0.0.50 (password auth)
+  >>> Checking license status...
+  Username: admin
+  Password: ****
+
+  10.0.0.50            ● 365 days
+```
+
+The stored auth type determines whether password or SSH key path is prompted on subsequent operations.
 
   [OK] Added 192.168.1.100
   >>> Checking license status...
@@ -776,7 +924,57 @@ brew install bash
 
 ## Version History
 
-### v3.3.1 (Current)
+### v3.8.6 (Current)
+- **Fixed password auth without sshpass** - `reload`, `apply-license`, `dossier` now work interactively
+- **Removed control master dependency** - Direct SSH commands instead of `-f -N` background connections
+- **Interactive password prompts** - When sshpass not installed, SSH prompts user directly for password
+- **Better auth feedback** - Shows which auth method is being used (key, password, interactive)
+
+### v3.8.5
+- Perpetual license support - correctly displays "PERPETUAL" status
+- Updated all status displays for perpetual licenses
+
+### v3.7.x
+- Fixed SSH connection hanging with timeouts
+- Fixed message order - credentials prompt before status check
+- SSH key path quoting fixes
+
+### v3.6.2
+- **SSH key path prompt** - Prompts for SSH key path with default (~/.ssh/id_rsa)
+- **Key file validation** - Checks if specified SSH key file exists before attempting connection
+- **Better key auth UX** - Shows which key file is being used for authentication
+
+### v3.6.1
+- **Username always prompted** - Username is no longer stored; always prompted for flexibility
+- **Auth type stored only** - Database stores only auth type (key/password) per device
+- **Simplified add workflow** - Only asks for auth type when adding, username on connect
+
+### v3.6.0
+- **Auth type selection on add** - Choose SSH key or password authentication when adding devices
+- **TMOS/Bash shell handling** - Automatically handles both TMOS and bash shell prompts on F5 devices
+- **Smarter credential prompts** - Only asks for password if device is configured for password auth
+
+### v3.5.1
+- **Fixed `reload` command** - Now properly uses SSH key authentication
+- **Fixed `dossier` SSH fallback** - Uses control connection for reliable key/password auth
+- **Better auth feedback** - Shows "Using SSH key authentication" when no password provided
+- **Consistent SSH handling** - All SSH commands now use the same auth logic
+
+### v3.5.0
+- **Per-device credentials** - Configure different credentials for each F5 device via environment variables
+- **Format: `F5_USER_<IP>`** - Replace dots with underscores (e.g., `F5_USER_10_0_0_1`)
+- **Credential priority** - Per-device → Global → Interactive prompt
+- **Mixed auth support** - Some devices can use password, others SSH key
+- **Help shows examples** - Per-device env var format documented in `help` command
+
+### v3.4.0
+- **SSH key authentication** - Support for passwordless SSH key-based authentication
+- **Flexible auth modes** - Auto-detect, force key, or force password via `SSH_AUTH_MODE`
+- **Custom SSH key path** - Specify key file via `F5_SSH_KEY` environment variable
+- **Updated credential prompt** - Shows hint about leaving password empty for key auth
+- **Help shows env vars** - Environment variables now documented in help output
+
+### v3.3.1
 - **SSH connection multiplexing** - Single password prompt for all license operations (backup, upload, reload)
 - **Fixed license paste** - Header text no longer included in license file content
 - **Cleaner output** - UI prompts sent to stderr, only data captured in variables
