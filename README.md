@@ -2,7 +2,7 @@
 
 A powerful, interactive CLI tool for F5 BIG-IP license lifecycle management. Manage licenses across multiple F5 devices from a single terminal interface.
 
-![Version](https://img.shields.io/badge/version-3.8.6-blue.svg)
+![Version](https://img.shields.io/badge/version-3.8.7-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20BSD%20%7C%20WSL-lightgrey.svg)
 ![Bash](https://img.shields.io/badge/bash-3.2%2B-green.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
@@ -221,7 +221,7 @@ export F5_USER_172_16_0_10=root
 ## Interface
 
 ```
-  ███████╗███████╗   License Manager v3.8.6
+  ███████╗███████╗   License Manager v3.8.7
   ██╔════╝██╔════╝   F5 BIG-IP License Lifecycle Tool
   █████╗  ███████╗
   ██╔══╝  ╚════██║   Type help for commands
@@ -924,7 +924,14 @@ brew install bash
 
 ## Version History
 
-### v3.8.6 (Current)
+### v3.8.7 (Current)
+- **Fixed credential loading order** - Environment variables now loaded before clearing shell variables, preventing env vars from being shadowed
+- **License date parsing fix** - Now uses "License End Date" instead of "Service Check Date" for accurate license expiration detection
+- **Improved perpetual license handling** - Empty expiration is valid (perpetual license), only errors if no registration key found
+- **Auto-detect env credentials on add** - When adding devices with credentials set via environment variables, skips interactive prompts and auto-detects auth type
+- **Device validation in details** - Added existence check before fetching device details
+
+### v3.8.6
 - **Fixed password auth without sshpass** - `reload`, `apply-license`, `dossier` now work interactively
 - **Removed control master dependency** - Direct SSH commands instead of `-f -N` background connections
 - **Interactive password prompts** - When sshpass not installed, SSH prompts user directly for password

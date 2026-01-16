@@ -4,7 +4,7 @@
 #   F5 LICENSE MANAGER (f5lm)
 #   Interactive CLI for F5 BIG-IP License Lifecycle Management
 #
-#   Version:       3.2.0
+#   Version:       3.8.7
 #   Compatibility: Linux, macOS, FreeBSD, WSL, Cygwin
 #   Requirements:  bash 3.2+, curl, jq
 #   Optional:      sshpass (for SSH password automation)
@@ -22,7 +22,7 @@
 set -o pipefail 2>/dev/null || true
 
 # Script metadata
-readonly F5LM_VERSION="3.8.6"
+readonly F5LM_VERSION="3.8.7"
 readonly F5LM_NAME="F5 License Manager"
 
 # Exit codes
@@ -601,16 +601,17 @@ has_device_credentials() {
 prompt_credentials() {
     local context="${1:-}"
     local ip="${context:-}"
-    
-    # Clear any stale credentials from previous operations
-    F5_USER=""
-    F5_PASS=""
-    F5_SSH_KEY=""
-    
-    # Try to load credentials from env vars first
+
+    # Try to load credentials from env vars FIRST, before clearing
+    # (Setting shell variables can shadow/unset env vars in bash)
     if [[ -n "$ip" ]] && load_device_credentials "$ip"; then
         return 0
     fi
+
+    # No env credentials found - clear any stale shell variables
+    F5_USER=""
+    F5_PASS=""
+    F5_SSH_KEY=""
     
     # Get stored auth type for this device
     local db_auth_type=""
@@ -1328,17 +1329,21 @@ _get_license_via_ssh() {
     # Parse registration key
     local regkey=""
     regkey=$(echo "$lic_output" | grep -i "Registration Key" | awk '{print $NF}' | head -1)
-    
-    # Parse expiration date
+
+    # Parse expiration date - look for "License End Date" specifically
+    # "Service Check Date" is NOT the expiration date - it's the entitlement check date
+    # If no "License End Date" exists, the license is perpetual
     local expires=""
-    expires=$(echo "$lic_output" | grep -i "Service Check Date" | awk '{print $NF}' | head -1)
-    
-    # If no expiration from tmsh, try license file directly
+    expires=$(echo "$lic_output" | grep -i "License End Date" | awk '{print $NF}' | head -1)
+
+    # If no License End Date found, try license file directly
     if [[ -z "$expires" ]]; then
         local expires_output
-        expires_output=$(_f5_ssh_cmd "$ip" "grep -i 'Service check date' /config/bigip.license" 10)
-        expires=$(echo "$expires_output" | sed 's/.*[Ss]ervice [Cc]heck [Dd]ate[: ]*//' | awk '{print $1}')
+        expires_output=$(_f5_ssh_cmd "$ip" "grep -i 'License end' /config/bigip.license" 10)
+        expires=$(echo "$expires_output" | sed 's/.*[Ll]icense [Ee]nd[^:]*[: ]*//' | awk '{print $1}')
     fi
+
+    # If still no expiration found, it's a perpetual license - leave expires empty
     
     # Return in format: regkey|expires
     echo "${regkey}|${expires}"
@@ -1394,7 +1399,9 @@ _check_single_device() {
         expires="${parsed##*|}"
     fi
     
-    if [[ -z "$expires" ]]; then
+    # If no regkey found, we have no license data
+    # But empty expires is valid (perpetual license)
+    if [[ -z "$regkey" ]]; then
         printf '%b%s no license data%b\n' "$Y" "$SYM_WAIT" "$RS"
         return 1
     fi
@@ -1418,66 +1425,120 @@ _check_single_device() {
 
 cmd_add() {
     local ip="$1"
-    
+
     # Clean input
     ip="${ip#https://}"
     ip="${ip#http://}"
     ip="${ip%%/*}"
     ip="${ip%%:*}"
-    
+
     if [[ -z "$ip" ]]; then
         msg_err "Usage: add <ip>"
         return 1
     fi
-    
+
     # Basic validation (alphanumeric, dots, dashes)
     if [[ ! "$ip" =~ ^[a-zA-Z0-9._-]+$ ]]; then
         msg_err "Invalid IP/hostname: $ip"
         return 1
     fi
-    
+
     if db_exists "$ip"; then
         msg_warn "$ip already exists"
         return 1
     fi
-    
-    # Prompt for SSH authentication type
-    printf '\n'
-    printf '  %bSSH Authentication for %b%s%b\n' "$C" "$BD" "$ip" "$RS"
-    printf '\n'
-    printf '  %b[1]%b SSH Key (passwordless)\n' "$BD" "$RS"
-    printf '  %b[2]%b Password\n' "$BD" "$RS"
-    printf '\n'
-    printf '  Auth type [1/2]: '
-    local auth_choice
-    read -r auth_choice
-    
-    local auth_type
-    case "$auth_choice" in
-        2)
-            auth_type="password"
-            ;;
-        *)
+
+    # Check if credentials are provided via environment variables
+    local env_user env_pass env_key
+    env_user=$(printenv "F5_USER" 2>/dev/null)
+    env_pass=$(printenv "F5_PASS" 2>/dev/null)
+    env_key=$(printenv "F5_SSH_KEY" 2>/dev/null)
+
+    # Also check per-device env vars
+    local suffix
+    suffix=$(_ip_to_env_suffix "$ip")
+    local per_user per_pass per_key
+    per_user=$(printenv "F5_USER_${suffix}" 2>/dev/null)
+    per_pass=$(printenv "F5_PASS_${suffix}" 2>/dev/null)
+    per_key=$(printenv "F5_SSH_KEY_${suffix}" 2>/dev/null)
+
+    # Per-device takes precedence
+    [[ -n "$per_user" ]] && env_user="$per_user"
+    [[ -n "$per_pass" ]] && env_pass="$per_pass"
+    [[ -n "$per_key" ]] && env_key="$per_key"
+
+    local auth_type=""
+    local use_env_creds=0
+
+    # Determine if we have valid credentials from environment
+    if [[ -n "$env_user" ]]; then
+        if [[ -n "$env_key" && -f "$env_key" ]]; then
+            # SSH key auth from env
             auth_type="key"
-            ;;
-    esac
-    
-    printf '\n'
-    
+            use_env_creds=1
+            F5_USER="$env_user"
+            F5_PASS=""
+            F5_SSH_KEY="$env_key"
+        elif [[ -n "$env_pass" ]]; then
+            # Password auth from env
+            auth_type="password"
+            use_env_creds=1
+            F5_USER="$env_user"
+            F5_PASS="$env_pass"
+            F5_SSH_KEY=""
+        fi
+    fi
+
+    if [[ "$use_env_creds" -eq 0 ]]; then
+        # No valid env credentials - prompt interactively
+        printf '\n'
+        printf '  %bSSH Authentication for %b%s%b\n' "$C" "$BD" "$ip" "$RS"
+        printf '\n'
+        printf '  %b[1]%b SSH Key (passwordless)\n' "$BD" "$RS"
+        printf '  %b[2]%b Password\n' "$BD" "$RS"
+        printf '\n'
+        printf '  Auth type [1/2]: '
+        local auth_choice
+        read -r auth_choice
+
+        case "$auth_choice" in
+            2)
+                auth_type="password"
+                ;;
+            *)
+                auth_type="key"
+                ;;
+        esac
+
+        printf '\n'
+    fi
+
     if db_add "$ip" "$auth_type"; then
         msg_ok "Added ${BD}$ip${RS} (${auth_type} auth)"
-        
+
+        if [[ "$use_env_creds" -eq 1 ]]; then
+            # Using env credentials - skip prompts, go straight to check
+            printf '\n'
+            msg "  ${D}Using credentials from environment${RS}"
+            msg_info "Checking license status..."
+            _check_single_device "$ip"
+
+            # Clear credentials after check
+            F5_USER="" F5_PASS="" F5_SSH_KEY=""
+            return 0
+        fi
+
         # Prompt for credentials first
         printf '\n'
         printf '  Username: '
         read -r F5_USER
-        
+
         if [[ -z "$F5_USER" ]]; then
             printf '      %bRun "check %s" to fetch license info%b\n' "$D" "$ip" "$RS"
             F5_USER="" F5_PASS="" F5_SSH_KEY=""
             return 0
         fi
-        
+
         if [[ "$auth_type" == "key" ]]; then
             F5_PASS=""
             # Prompt for SSH key path
@@ -1485,35 +1546,35 @@ cmd_add() {
             printf '  SSH Key [%s]: ' "$default_key"
             read -r F5_SSH_KEY
             [[ -z "$F5_SSH_KEY" ]] && F5_SSH_KEY="$default_key"
-            
+
             # Expand ~ if present
             F5_SSH_KEY="${F5_SSH_KEY/#\~/$HOME}"
-            
+
             if [[ ! -f "$F5_SSH_KEY" ]]; then
                 msg_err "SSH key not found: $F5_SSH_KEY"
                 printf '      %bRun "check %s" to fetch license info%b\n' "$D" "$ip" "$RS"
                 F5_USER="" F5_PASS="" F5_SSH_KEY=""
                 return 0
             fi
-            
+
             msg "  ${D}Using SSH key: $F5_SSH_KEY${RS}"
         else
             printf '  Password: '
             read -rs F5_PASS
             printf '\n'
-            
+
             if [[ -z "$F5_PASS" ]]; then
                 printf '      %bRun "check %s" to fetch license info%b\n' "$D" "$ip" "$RS"
                 F5_USER="" F5_PASS="" F5_SSH_KEY=""
                 return 0
             fi
         fi
-        
+
         # Now show checking message and perform check
         printf '\n'
         msg_info "Checking license status..."
         _check_single_device "$ip"
-        
+
         # Clear credentials after check
         F5_USER="" F5_PASS="" F5_SSH_KEY=""
     else
@@ -1900,7 +1961,9 @@ cmd_check() {
         F5_PASS="$saved_pass"
         F5_SSH_KEY="$saved_key"
         
-        if [[ -z "$expires" ]]; then
+        # If no regkey found, license data isn't ready
+        # But empty expires is valid (perpetual license)
+        if [[ -z "$regkey" ]]; then
             printf '%b%s pending%b %b(license data not ready)%b\n' \
                 "$Y" "$SYM_WAIT" "$RS" "$D" "$RS"
             restarting=$((restarting + 1))
@@ -2058,12 +2121,18 @@ _get_license_details_via_ssh() {
 
 cmd_details() {
     local ip="$1"
-    
+
     if [[ -z "$ip" ]]; then
         msg_err "Usage: details <ip>"
         return 1
     fi
-    
+
+    # Check if device exists in database
+    if ! db_exists "$ip"; then
+        msg_err "Device $ip not found"
+        return 1
+    fi
+
     prompt_credentials "$ip" || return 1
     
     printf '\n'
