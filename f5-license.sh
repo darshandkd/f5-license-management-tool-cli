@@ -668,8 +668,8 @@ db_add() {
     tmp=$(make_temp_file "f5lm_db") || return 1
     
     if jq --arg ip "$ip" --arg ts "$ts" --arg auth "${auth_type:-}" \
-        'if type == "array" then . else [] end | 
-         . + [{"ip":$ip,"added":$ts,"checked":null,"expires":null,"days":null,"status":"new","regkey":null,"auth_type":$auth}]' \
+        'if type == "array" then . else [] end |
+         . + [{"ip":$ip,"added":$ts,"checked":null,"expires":null,"days":null,"status":"new","regkey":null,"auth_type":$auth,"svc_check_date":null}]' \
         "$DB_FILE" > "$tmp" 2>/dev/null; then
         mv "$tmp" "$DB_FILE" && log_event "ADDED $ip" && return 0
     fi
@@ -703,20 +703,20 @@ db_get_auth_type() {
 }
 
 db_update() {
-    local ip="$1" expires="$2" days="$3" status="$4" regkey="$5"
+    local ip="$1" expires="$2" days="$3" status="$4" regkey="$5" svc_check="${6:-}"
     local ts
     ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null) || ts=$(date '+%Y-%m-%dT%H:%M:%SZ')
-    
+
     local tmp
     tmp=$(make_temp_file "f5lm_db") || return 1
-    
+
     if jq --arg ip "$ip" --arg ts "$ts" --arg exp "$expires" \
-          --arg d "$days" --arg st "$status" --arg rk "$regkey" \
-        '(.[] | select(.ip == $ip)) |= . + {checked:$ts, expires:$exp, days:$d, status:$st, regkey:$rk}' \
+          --arg d "$days" --arg st "$status" --arg rk "$regkey" --arg svc "$svc_check" \
+        '(.[] | select(.ip == $ip)) |= . + {checked:$ts, expires:$exp, days:$d, status:$st, regkey:$rk, svc_check_date:$svc}' \
         "$DB_FILE" > "$tmp" 2>/dev/null; then
         mv "$tmp" "$DB_FILE" && return 0
     fi
-    
+
     rm -f "$tmp" 2>/dev/null
     return 1
 }
@@ -1220,15 +1220,15 @@ f5_install_license() {
 # Parse license JSON response
 parse_license_info() {
     local json="$1"
-    # Return format: regkey|license_end_date
+    # Return format: regkey|license_end_date|service_check_date
     # Use License End Date for expiration tracking (per K7727, K000151595)
     # License End Date is when the license actually expires (subscription/eval/trial)
     # Empty/null/N/A means perpetual license (device runs forever)
-    # Note: Service Check Date is only for upgrade eligibility, NOT license expiration
+    # Service Check Date is for upgrade eligibility, NOT license expiration
     printf '%s' "$json" | jq -r '
         .entries | to_entries[] | select(.key | contains("/license/")) |
         .value.nestedStats.entries |
-        "\(.registrationKey.description // "")|\(.licenseEndDate.description // "")"
+        "\(.registrationKey.description // "")|\(.licenseEndDate.description // "")|\(.serviceCheckDate.description // "")"
     ' 2>/dev/null | head -1
 }
 
@@ -1563,21 +1563,23 @@ show_devices() {
         return
     fi
 
-    printf '  %b%-3s %-18s %-14s %-10s %-12s%b\n' "$D" "#" "IP ADDRESS" "EXPIRES" "DAYS" "STATUS" "$RS"
-    draw_line 60
+    printf '  %b%-3s %-18s %-12s %-12s %-8s %-12s%b\n' "$D" "#" "IP ADDRESS" "EXPIRES" "SVC CHK" "DAYS" "STATUS" "$RS"
+    draw_line 70
 
     local i=0
     while [[ "$i" -lt "$count" ]]; do
-        local ip expires days status
+        local ip expires days status svc_check
         local status_sym status_color days_display
 
         ip=$(jq -r ".[$i].ip // \"\"" "$DB_FILE" 2>/dev/null)
         expires=$(jq -r ".[$i].expires // \"-\"" "$DB_FILE" 2>/dev/null)
+        svc_check=$(jq -r ".[$i].svc_check_date // \"-\"" "$DB_FILE" 2>/dev/null)
         days=$(jq -r ".[$i].days // \"?\"" "$DB_FILE" 2>/dev/null)
         status=$(jq -r ".[$i].status // \"new\"" "$DB_FILE" 2>/dev/null)
 
         # Handle null strings
         [[ "$expires" == "null" ]] && expires="-"
+        [[ "$svc_check" == "null" || -z "$svc_check" ]] && svc_check="-"
         [[ "$days" == "null" ]] && days="?"
         [[ "$status" == "null" ]] && status="new"
 
@@ -1590,8 +1592,8 @@ show_devices() {
             *)         status_sym="$SYM_PENDING"; status_color="$D"; days_display="?" ;;
         esac
 
-        printf '  %-3s %-18s %-14s %-10s %b%s %s%b\n' \
-            "$((i+1))" "$ip" "${expires:--}" "$days_display" "$status_color" "$status_sym" "$status" "$RS"
+        printf '  %-3s %-18s %-12s %-12s %-8s %b%s %s%b\n' \
+            "$((i+1))" "$ip" "${expires:--}" "${svc_check:--}" "$days_display" "$status_color" "$status_sym" "$status" "$RS"
 
         i=$((i + 1))
     done
@@ -1707,6 +1709,10 @@ _get_license_via_ssh() {
     local license_end=""
     license_end=$(echo "$lic_output" | grep -i "License End Date" | awk '{print $NF}' | head -1)
 
+    # Parse Service Check Date (for upgrade eligibility)
+    local service_check=""
+    service_check=$(echo "$lic_output" | grep -i "Service Check Date" | awk '{print $NF}' | head -1)
+
     # If no License End Date found in tmsh output, try license file directly
     if [[ -z "$license_end" ]]; then
         local license_output
@@ -1716,41 +1722,43 @@ _get_license_via_ssh() {
 
     # If still no License End Date found, leave empty (means perpetual license)
 
-    # Return in format: regkey|license_end_date
-    echo "${regkey}|${license_end}"
+    # Return in format: regkey|license_end_date|service_check_date
+    echo "${regkey}|${license_end}|${service_check}"
 }
 
 # Internal function to check a single device (no credential prompt)
 # Supports both REST API (password) and SSH (key) authentication
 _check_single_device() {
     local ip="$1"
-    
+
     printf '  %-20s ' "$ip"
-    
+
     # Check if this device uses key auth
     local db_auth_type
     db_auth_type=$(db_get_auth_type "$ip")
-    
-    local regkey="" expires=""
-    
+
+    local regkey="" expires="" svc_check=""
+
     if [[ "$db_auth_type" == "key" && -n "$F5_SSH_KEY" && -z "$F5_PASS" ]]; then
         # Use SSH to get license info
         local ssh_result
         ssh_result=$(_get_license_via_ssh "$ip")
-        
-        if [[ -z "$ssh_result" || "$ssh_result" == "|" ]]; then
+
+        if [[ -z "$ssh_result" || "$ssh_result" == "||" ]]; then
             printf '%b%s SSH failed%b\n' "$R" "$SYM_ERR" "$RS"
             return 1
         fi
-        
-        regkey="${ssh_result%%|*}"
-        expires="${ssh_result##*|}"
+
+        # Parse format: regkey|license_end_date|service_check_date
+        regkey=$(echo "$ssh_result" | cut -d'|' -f1)
+        expires=$(echo "$ssh_result" | cut -d'|' -f2)
+        svc_check=$(echo "$ssh_result" | cut -d'|' -f3)
     else
         # Use REST API (password auth)
         local auth_resp token
         auth_resp=$(f5_auth "$ip" 10)
         token=$(echo "$auth_resp" | jq -r '.token.token // empty' 2>/dev/null)
-        
+
         if [[ -z "$token" ]]; then
             # Determine the reason for failure
             if [[ -z "$auth_resp" ]]; then
@@ -1762,28 +1770,30 @@ _check_single_device() {
             fi
             return 1
         fi
-        
+
         local lic_json parsed
         lic_json=$(f5_get_license "$ip" "$token" 10)
         parsed=$(parse_license_info "$lic_json")
-        regkey="${parsed%%|*}"
-        expires="${parsed##*|}"
+        # Parse format: regkey|license_end_date|service_check_date
+        regkey=$(echo "$parsed" | cut -d'|' -f1)
+        expires=$(echo "$parsed" | cut -d'|' -f2)
+        svc_check=$(echo "$parsed" | cut -d'|' -f3)
     fi
-    
+
     # If no regkey found, we have no license data
     # But empty expires is valid (perpetual license)
     if [[ -z "$regkey" ]]; then
         printf '%b%s no license data%b\n' "$Y" "$SYM_WAIT" "$RS"
         return 1
     fi
-    
+
     local days status
     days=$(calc_days_until "$expires")
     status=$(get_status_from_days "$days")
-    
-    db_update "$ip" "$expires" "$days" "$status" "$regkey"
+
+    db_update "$ip" "$expires" "$days" "$status" "$regkey" "$svc_check"
     log_event "CHECKED $ip: $status ($days)"
-    
+
     case "$status" in
         perpetual) printf '%b%s perpetual%b\n' "$G" "$SYM_OK" "$RS" ;;
         active)    printf '%b%s %s days%b\n' "$G" "$SYM_OK" "$days" "$RS" ;;
@@ -2181,27 +2191,29 @@ cmd_add_multi() {
             continue
         fi
         
-        local lic_json parsed regkey expires days status
+        local lic_json parsed regkey expires svc_check days status
         lic_json=$(f5_get_license "$ip" "$token" 10)
         parsed=$(parse_license_info "$lic_json")
-        regkey="${parsed%%|*}"
-        expires="${parsed##*|}"
-        
+        # Parse format: regkey|license_end_date|service_check_date
+        regkey=$(echo "$parsed" | cut -d'|' -f1)
+        expires=$(echo "$parsed" | cut -d'|' -f2)
+        svc_check=$(echo "$parsed" | cut -d'|' -f3)
+
         # Restore credentials
         F5_USER="$saved_user"
         F5_PASS="$saved_pass"
         F5_SSH_KEY="$saved_key"
-        
+
         if [[ -z "$expires" ]]; then
             printf '%b%s no license data%b\n' "$Y" "$SYM_WAIT" "$RS"
             fail=$((fail + 1))
             continue
         fi
-        
+
         days=$(calc_days_until "$expires")
         status=$(get_status_from_days "$days")
-        
-        db_update "$ip" "$expires" "$days" "$status" "$regkey"
+
+        db_update "$ip" "$expires" "$days" "$status" "$regkey" "$svc_check"
         log_event "CHECKED $ip: $status ($days)"
         
         case "$status" in
@@ -2371,15 +2383,15 @@ cmd_check() {
         F5_PASS="$current_pass"
         F5_SSH_KEY="$current_key"
         
-        local regkey="" expires=""
-        
+        local regkey="" expires="" svc_check=""
+
         # Use SSH for key auth, REST API for password auth
         if [[ "$db_auth_type" == "key" && -n "$current_key" && -z "$current_pass" ]]; then
             # Use SSH to get license info
             local ssh_result
             ssh_result=$(_get_license_via_ssh "$ip")
-            
-            if [[ -z "$ssh_result" || "$ssh_result" == "|" ]]; then
+
+            if [[ -z "$ssh_result" || "$ssh_result" == "||" ]]; then
                 printf '%b%s SSH failed%b %b(check key permissions)%b\n' \
                     "$R" "$SYM_ERR" "$RS" "$D" "$RS"
                 fail=$((fail + 1))
@@ -2388,15 +2400,17 @@ cmd_check() {
                 F5_SSH_KEY="$saved_key"
                 continue
             fi
-            
-            regkey="${ssh_result%%|*}"
-            expires="${ssh_result##*|}"
+
+            # Parse format: regkey|license_end_date|service_check_date
+            regkey=$(echo "$ssh_result" | cut -d'|' -f1)
+            expires=$(echo "$ssh_result" | cut -d'|' -f2)
+            svc_check=$(echo "$ssh_result" | cut -d'|' -f3)
         else
             # Use REST API (password auth)
             local auth_resp token auth_error
             auth_resp=$(f5_auth "$ip" 15)
             token=$(printf '%s' "$auth_resp" | jq -r '.token.token // empty' 2>/dev/null)
-            
+
             if [[ -z "$token" ]]; then
                 # Determine the reason for failure
                 if [[ -z "$auth_resp" ]]; then
@@ -2430,19 +2444,21 @@ cmd_check() {
                 F5_SSH_KEY="$saved_key"
                 continue
             fi
-            
+
             local lic_json parsed
             lic_json=$(f5_get_license "$ip" "$token" 15)
             parsed=$(parse_license_info "$lic_json")
-            regkey="${parsed%%|*}"
-            expires="${parsed##*|}"
+            # Parse format: regkey|license_end_date|service_check_date
+            regkey=$(echo "$parsed" | cut -d'|' -f1)
+            expires=$(echo "$parsed" | cut -d'|' -f2)
+            svc_check=$(echo "$parsed" | cut -d'|' -f3)
         fi
-        
+
         # Restore credentials
         F5_USER="$saved_user"
         F5_PASS="$saved_pass"
         F5_SSH_KEY="$saved_key"
-        
+
         # If no regkey found, license data isn't ready
         # But empty expires is valid (perpetual license)
         if [[ -z "$regkey" ]]; then
@@ -2452,12 +2468,12 @@ cmd_check() {
             fail=$((fail + 1))
             continue
         fi
-        
+
         local days status
         days=$(calc_days_until "$expires")
         status=$(get_status_from_days "$days")
-        
-        db_update "$ip" "$expires" "$days" "$status" "$regkey"
+
+        db_update "$ip" "$expires" "$days" "$status" "$regkey" "$svc_check"
         log_event "CHECKED $ip: $status ($days)"
         
         case "$status" in
@@ -2507,41 +2523,45 @@ verify_with_retry() {
     
     while [[ $elapsed -lt $max_wait ]]; do
         printf '\r  %bChecking... (%ds/%ds)%b   ' "$C" "$elapsed" "$max_wait" "$RS"
-        
-        local expires="" regkey=""
-        
+
+        local expires="" regkey="" svc_check=""
+
         if [[ "$db_auth_type" == "key" && -n "$F5_SSH_KEY" && -z "$F5_PASS" ]]; then
             # Use SSH for key auth
             local ssh_result
             ssh_result=$(_get_license_via_ssh "$ip" 2>/dev/null)
-            if [[ -n "$ssh_result" && "$ssh_result" != "|" ]]; then
-                regkey="${ssh_result%%|*}"
-                expires="${ssh_result##*|}"
+            if [[ -n "$ssh_result" && "$ssh_result" != "||" ]]; then
+                # Parse format: regkey|license_end_date|service_check_date
+                regkey=$(echo "$ssh_result" | cut -d'|' -f1)
+                expires=$(echo "$ssh_result" | cut -d'|' -f2)
+                svc_check=$(echo "$ssh_result" | cut -d'|' -f3)
             fi
         else
             # Use REST API
             local auth_resp token
             auth_resp=$(f5_auth "$ip" 10 2>/dev/null)
             token=$(printf '%s' "$auth_resp" | jq -r '.token.token // empty' 2>/dev/null)
-            
+
             if [[ -n "$token" ]]; then
                 local lic_json parsed
                 lic_json=$(f5_get_license "$ip" "$token" 10 2>/dev/null)
                 parsed=$(parse_license_info "$lic_json")
-                regkey="${parsed%%|*}"
-                expires="${parsed##*|}"
+                # Parse format: regkey|license_end_date|service_check_date
+                regkey=$(echo "$parsed" | cut -d'|' -f1)
+                expires=$(echo "$parsed" | cut -d'|' -f2)
+                svc_check=$(echo "$parsed" | cut -d'|' -f3)
             fi
         fi
-        
+
         if [[ -n "$expires" ]]; then
             printf '\r%60s\r' ""
             msg_ok "Device is back online"
             printf '\n'
-            
+
             local days status
             days=$(calc_days_until "$expires")
             status=$(get_status_from_days "$days")
-            db_update "$ip" "$expires" "$days" "$status" "$regkey"
+            db_update "$ip" "$expires" "$days" "$status" "$regkey" "$svc_check"
             
             printf '  %bLICENSE STATUS%b\n' "$BD" "$RS"
             printf '  %-20s ' "$ip"
@@ -2690,7 +2710,7 @@ cmd_details() {
     days=$(calc_days_until "$expires")
     status=$(get_status_from_days "$days")
 
-    db_update "$ip" "$expires" "$days" "$status" "$regkey"
+    db_update "$ip" "$expires" "$days" "$status" "$regkey" "$service"
 
     # JSON output mode
     if [[ "$JSON_OUTPUT" -eq 1 ]]; then
@@ -3785,12 +3805,12 @@ cmd_export() {
     local timestamp
     timestamp=$(date '+%Y%m%d_%H%M%S' 2>/dev/null) || timestamp=$(date '+%Y%m%d')
     local file="${DATA_DIR}/export_${timestamp}.csv"
-    
+
     {
-        printf 'ip,expires,days,status,regkey,checked\n'
-        jq -r '.[] | [.ip, .expires, .days, .status, .regkey, .checked] | @csv' "$DB_FILE" 2>/dev/null
+        printf 'ip,expires,svc_check_date,days,status,regkey,checked\n'
+        jq -r '.[] | [.ip, .expires, .svc_check_date, .days, .status, .regkey, .checked] | @csv' "$DB_FILE" 2>/dev/null
     } > "$file"
-    
+
     if [[ -f "$file" ]]; then
         msg_ok "Exported to $file"
     else
