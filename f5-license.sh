@@ -4,7 +4,7 @@
 #   F5 LICENSE MANAGER (f5lm)
 #   Interactive CLI for F5 BIG-IP License Lifecycle Management
 #
-#   Version:       3.8.7
+#   Version:       3.8.10
 #   Compatibility: Linux, macOS, FreeBSD, WSL, Cygwin
 #   Requirements:  bash 3.2+, curl, jq
 #   Optional:      sshpass (for SSH password automation)
@@ -22,7 +22,7 @@
 set -o pipefail 2>/dev/null || true
 
 # Script metadata
-readonly F5LM_VERSION="3.8.7"
+readonly F5LM_VERSION="3.8.10"
 readonly F5LM_NAME="F5 License Manager"
 
 # Exit codes
@@ -30,6 +30,18 @@ readonly EXIT_SUCCESS=0
 readonly EXIT_ERROR=1
 readonly EXIT_USAGE=2
 readonly EXIT_DEPENDENCY=3
+
+# Error codes for specific failure types
+readonly ERR_SSH_CONNECT=10      # SSH connection failed
+readonly ERR_SSH_AUTH=11         # SSH authentication failed
+readonly ERR_SSH_TIMEOUT=12      # SSH command timed out
+readonly ERR_REST_CONNECT=20     # REST API connection failed
+readonly ERR_REST_AUTH=21        # REST API authentication failed
+readonly ERR_REST_TIMEOUT=22     # REST API request timed out
+readonly ERR_DEVICE_NOT_FOUND=30 # Device not in database
+readonly ERR_INVALID_IP=31       # Invalid IP address format
+readonly ERR_LICENSE_PARSE=40    # Failed to parse license data
+readonly ERR_DOSSIER_GEN=41      # Failed to generate dossier
 
 #-------------------------------------------------------------------------------
 # GLOBAL VARIABLES (set by init functions)
@@ -58,6 +70,21 @@ SYM_OK="" SYM_WARN="" SYM_ERR="" SYM_PENDING="" SYM_WAIT="" SYM_ARROW=""
 # Credentials (from environment or prompt)
 F5_USER="${F5_USER:-}"
 F5_PASS="${F5_PASS:-}"
+
+# Debug/Verbose mode (can be set via --verbose/--debug or F5LM_VERBOSE env var)
+VERBOSE="${F5LM_VERBOSE:-0}"
+DEBUG_LOG_FILE=""
+
+# JSON output mode (can be set via --json flag)
+JSON_OUTPUT=0
+
+# Configurable timeouts (can be set via environment variables)
+# F5LM_SSH_TIMEOUT: SSH command timeout in seconds (default: 15)
+# F5LM_REST_TIMEOUT: REST API timeout in seconds (default: 20)
+# F5LM_CONNECT_TIMEOUT: SSH connect timeout in seconds (default: 10)
+F5LM_SSH_TIMEOUT="${F5LM_SSH_TIMEOUT:-15}"
+F5LM_REST_TIMEOUT="${F5LM_REST_TIMEOUT:-20}"
+F5LM_CONNECT_TIMEOUT="${F5LM_CONNECT_TIMEOUT:-10}"
 
 #-------------------------------------------------------------------------------
 # CLEANUP & SIGNAL HANDLING
@@ -101,6 +128,64 @@ make_temp_file() {
     
     TEMP_FILES+=("$tmpfile")
     echo "$tmpfile"
+}
+
+#-------------------------------------------------------------------------------
+# DEBUG/VERBOSE LOGGING
+#-------------------------------------------------------------------------------
+# Initialize debug logging (creates log file if verbose mode enabled)
+init_debug_log() {
+    if [[ "$VERBOSE" -ge 1 ]]; then
+        local log_dir="${DATA_DIR:-$HOME/.f5lm}/logs"
+        mkdir -p "$log_dir" 2>/dev/null
+        DEBUG_LOG_FILE="$log_dir/debug_$(date +%Y%m%d_%H%M%S).log"
+        debug_log "=== F5LM Debug Session Started ==="
+        debug_log "Version: $F5LM_VERSION"
+        debug_log "Platform: ${PLATFORM:-detecting}"
+        debug_log "Bash: $BASH_VERSION"
+    fi
+}
+
+# Log debug message (only when VERBOSE >= 1)
+debug_log() {
+    [[ "$VERBOSE" -lt 1 ]] && return
+    local msg="$1"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+    # Log to file if available
+    if [[ -n "$DEBUG_LOG_FILE" ]]; then
+        printf '[%s] %s\n' "$timestamp" "$msg" >> "$DEBUG_LOG_FILE" 2>/dev/null
+    fi
+
+    # Also print to stderr if VERBOSE >= 2 (debug mode)
+    if [[ "$VERBOSE" -ge 2 ]]; then
+        printf '%s[DEBUG]%s %s\n' "${D:-}" "${RS:-}" "$msg" >&2
+    fi
+}
+
+# Log verbose message (shown on screen when VERBOSE >= 1)
+verbose_msg() {
+    [[ "$VERBOSE" -lt 1 ]] && return
+    local msg="$1"
+    printf '%s[VERBOSE]%s %s\n' "${D:-}" "${RS:-}" "$msg" >&2
+    debug_log "$msg"
+}
+
+# Log SSH command (redacts passwords)
+debug_ssh() {
+    [[ "$VERBOSE" -lt 1 ]] && return
+    local cmd="$1"
+    local ip="$2"
+    debug_log "SSH [$ip]: $cmd"
+}
+
+# Log curl command (redacts auth tokens)
+debug_curl() {
+    [[ "$VERBOSE" -lt 1 ]] && return
+    local url="$1"
+    local method="${2:-GET}"
+    debug_log "CURL [$method]: $url"
 }
 
 #-------------------------------------------------------------------------------
@@ -291,6 +376,68 @@ setup_data_dir() {
     LOG_FILE="${DATA_DIR}/history.log"
     HIST_FILE="${DATA_DIR}/.cmd_history"
     LOCK_FILE="${DATA_DIR}/.lock"
+    CONFIG_FILE="${DATA_DIR}/config"
+}
+
+#-------------------------------------------------------------------------------
+# CONFIGURATION FILE SUPPORT
+#-------------------------------------------------------------------------------
+# Load configuration from ~/.f5lm/config
+# Format: KEY=value (one per line, # for comments)
+# Environment variables take precedence over config file
+load_config() {
+    [[ ! -f "$CONFIG_FILE" ]] && return 0
+
+    local line key value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Skip empty lines and comments
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # Remove leading/trailing whitespace
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+
+        # Parse KEY=value
+        if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            value="${BASH_REMATCH[2]}"
+
+            # Remove surrounding quotes if present
+            if [[ "$value" =~ ^\"(.*)\"$ ]] || [[ "$value" =~ ^\'(.*)\'$ ]]; then
+                value="${BASH_REMATCH[1]}"
+            fi
+
+            # Only set if not already set by environment variable
+            case "$key" in
+                F5LM_DEFAULT_USER)
+                    [[ -z "$(printenv F5LM_DEFAULT_USER 2>/dev/null)" ]] && export F5LM_DEFAULT_USER="$value"
+                    ;;
+                F5LM_SSH_KEY)
+                    [[ -z "$(printenv F5LM_SSH_KEY 2>/dev/null)" ]] && export F5LM_SSH_KEY="$value"
+                    ;;
+                F5LM_SSH_TIMEOUT)
+                    [[ -z "$(printenv F5LM_SSH_TIMEOUT 2>/dev/null)" ]] && F5LM_SSH_TIMEOUT="$value"
+                    ;;
+                F5LM_REST_TIMEOUT)
+                    [[ -z "$(printenv F5LM_REST_TIMEOUT 2>/dev/null)" ]] && F5LM_REST_TIMEOUT="$value"
+                    ;;
+                F5LM_CONNECT_TIMEOUT)
+                    [[ -z "$(printenv F5LM_CONNECT_TIMEOUT 2>/dev/null)" ]] && F5LM_CONNECT_TIMEOUT="$value"
+                    ;;
+                F5LM_VERBOSE)
+                    [[ -z "$(printenv F5LM_VERBOSE 2>/dev/null)" ]] && VERBOSE="$value"
+                    ;;
+                F5LM_NO_COLOR)
+                    if [[ -z "$(printenv F5LM_NO_COLOR 2>/dev/null)" && "$value" =~ ^(1|true|yes)$ ]]; then
+                        NO_COLOR=1
+                        R="" G="" Y="" B="" C="" M="" D="" RS="" BD=""
+                    fi
+                    ;;
+            esac
+
+            debug_log "Config loaded: $key=$value"
+        fi
+    done < "$CONFIG_FILE"
 }
 
 #-------------------------------------------------------------------------------
@@ -308,10 +455,82 @@ msg_err()  { printf '  %b[ERROR]%b %s\n' "$R" "$RS" "$1" >&2; }
 msg_warn() { printf '  %b[WARN]%b %s\n' "$Y" "$RS" "$1"; }
 msg_info() { printf '  %b%s%b %s\n' "$C" "$SYM_ARROW" "$RS" "$1"; }
 
+# Enhanced error message with troubleshooting hints
+# Usage: msg_err_hint "Error message" "error_type"
+# error_type: ssh_connect, ssh_auth, ssh_timeout, rest_connect, rest_auth, rest_timeout, etc.
+msg_err_hint() {
+    local message="$1"
+    local error_type="${2:-}"
+
+    msg_err "$message"
+
+    # Provide actionable troubleshooting hints based on error type
+    case "$error_type" in
+        ssh_connect)
+            printf '  %b└─ Hint:%b Check if device is reachable: ping <ip>\n' "$D" "$RS" >&2
+            printf '  %b       %b Check SSH port: nc -zv <ip> 22\n' "$D" "$RS" >&2
+            printf '  %b       %b Increase timeout: F5LM_CONNECT_TIMEOUT=%d\n' "$D" "$RS" "$F5LM_CONNECT_TIMEOUT" >&2
+            ;;
+        ssh_auth)
+            printf '  %b└─ Hint:%b Verify credentials are correct\n' "$D" "$RS" >&2
+            printf '  %b       %b For key auth: check F5_SSH_KEY path exists\n' "$D" "$RS" >&2
+            printf '  %b       %b For password auth: try with --verbose flag\n' "$D" "$RS" >&2
+            ;;
+        ssh_timeout)
+            printf '  %b└─ Hint:%b Device may be slow or overloaded\n' "$D" "$RS" >&2
+            printf '  %b       %b Increase timeout: F5LM_SSH_TIMEOUT=%d (current)\n' "$D" "$RS" "$F5LM_SSH_TIMEOUT" >&2
+            printf '  %b       %b Example: F5LM_SSH_TIMEOUT=30 f5lm check <ip>\n' "$D" "$RS" >&2
+            ;;
+        rest_connect)
+            printf '  %b└─ Hint:%b Check if REST API is enabled on device\n' "$D" "$RS" >&2
+            printf '  %b       %b Verify HTTPS port 443 is accessible\n' "$D" "$RS" >&2
+            printf '  %b       %b Try: curl -sk https://<ip>/mgmt/tm/sys/version\n' "$D" "$RS" >&2
+            ;;
+        rest_auth)
+            printf '  %b└─ Hint:%b Verify username/password are correct\n' "$D" "$RS" >&2
+            printf '  %b       %b Check user has admin role on device\n' "$D" "$RS" >&2
+            printf '  %b       %b REST API requires local authentication\n' "$D" "$RS" >&2
+            ;;
+        rest_timeout)
+            printf '  %b└─ Hint:%b REST API request timed out\n' "$D" "$RS" >&2
+            printf '  %b       %b Increase timeout: F5LM_REST_TIMEOUT=%d (current)\n' "$D" "$RS" "$F5LM_REST_TIMEOUT" >&2
+            printf '  %b       %b Device may be under heavy load\n' "$D" "$RS" >&2
+            ;;
+        device_not_found)
+            printf '  %b└─ Hint:%b Device not in database. Add it first:\n' "$D" "$RS" >&2
+            printf '  %b       %b f5lm add <ip>\n' "$D" "$RS" >&2
+            ;;
+        invalid_ip)
+            printf '  %b└─ Hint:%b Use valid IPv4 address or hostname\n' "$D" "$RS" >&2
+            printf '  %b       %b Examples: 10.1.1.1, bigip.example.com\n' "$D" "$RS" >&2
+            ;;
+        license_parse)
+            printf '  %b└─ Hint:%b Could not parse license information\n' "$D" "$RS" >&2
+            printf '  %b       %b Run with --debug for detailed output\n' "$D" "$RS" >&2
+            printf '  %b       %b Try: tmsh show sys license (on device)\n' "$D" "$RS" >&2
+            ;;
+        no_sshpass)
+            printf '  %b└─ Hint:%b sshpass not installed (password auth limited)\n' "$D" "$RS" >&2
+            printf '  %b       %b Install: brew install sshpass (macOS)\n' "$D" "$RS" >&2
+            printf '  %b       %b          apt install sshpass (Linux)\n' "$D" "$RS" >&2
+            printf '  %b       %b Or use SSH key authentication instead\n' "$D" "$RS" >&2
+            ;;
+    esac
+}
+
 # Fatal error and exit
 die() {
     msg_err "$1"
     exit "${2:-$EXIT_ERROR}"
+}
+
+# Fatal error with hint and exit
+die_hint() {
+    local message="$1"
+    local error_type="$2"
+    local exit_code="${3:-$EXIT_ERROR}"
+    msg_err_hint "$message" "$error_type"
+    exit "$exit_code"
 }
 
 # Draw horizontal line (pure ASCII)
@@ -536,6 +755,25 @@ _ip_to_env_suffix() {
     echo "${ip//[.:]/_}"
 }
 
+# Strip surrounding quotes (single or double) from a string
+# Handles: "path", 'path', path -> path
+_strip_quotes() {
+    local str="$1"
+    # Remove leading/trailing whitespace first
+    str="${str#"${str%%[![:space:]]*}"}"
+    str="${str%"${str##*[![:space:]]}"}"
+    # Remove surrounding double quotes
+    if [[ "$str" == \"*\" ]]; then
+        str="${str#\"}"
+        str="${str%\"}"
+    # Remove surrounding single quotes
+    elif [[ "$str" == \'*\' ]]; then
+        str="${str#\'}"
+        str="${str%\'}"
+    fi
+    printf '%s' "$str"
+}
+
 # Get credential for a specific device (checks per-device, then global, then returns empty)
 _get_device_credential() {
     local ip="$1"
@@ -646,21 +884,58 @@ prompt_credentials() {
     if [[ "$db_auth_type" == "key" ]]; then
         F5_PASS=""
         local default_key="$HOME/.ssh/id_rsa"
-        printf '  SSH Key [%s]: ' "$default_key"
-        read -r F5_SSH_KEY
-        [[ -z "$F5_SSH_KEY" ]] && F5_SSH_KEY="$default_key"
-        
-        # Expand ~ if present
-        F5_SSH_KEY="${F5_SSH_KEY/#\~/$HOME}"
-        
-        if [[ ! -f "$F5_SSH_KEY" ]]; then
+        while true; do
+            printf '  SSH Key [%s]: ' "$default_key"
+            read -r F5_SSH_KEY
+            [[ -z "$F5_SSH_KEY" ]] && F5_SSH_KEY="$default_key"
+
+            # Strip surrounding quotes (user may paste quoted path)
+            F5_SSH_KEY=$(_strip_quotes "$F5_SSH_KEY")
+
+            # Expand ~ if present
+            F5_SSH_KEY="${F5_SSH_KEY/#\~/$HOME}"
+
+            if [[ -f "$F5_SSH_KEY" ]]; then
+                msg "  ${D}Using SSH key: $F5_SSH_KEY${RS}"
+                printf '\n'
+                return 0
+            fi
+
+            # Key not found - offer options
             msg_err "SSH key not found: $F5_SSH_KEY"
-            return 1
-        fi
-        
-        msg "  ${D}Using SSH key: $F5_SSH_KEY${RS}"
-        printf '\n'
-        return 0
+            printf '\n'
+            printf '  %b[r]%b Retry with different path\n' "$BD" "$RS"
+            printf '  %b[p]%b Switch to password authentication\n' "$BD" "$RS"
+            printf '  %b[c]%b Cancel\n' "$D" "$RS"
+            printf '\n'
+            printf '  Choice [r/p/c]: '
+            local key_choice
+            read -r key_choice
+            case "$key_choice" in
+                p|P)
+                    # Switch to password auth
+                    if [[ -n "$ip" ]]; then
+                        db_update_auth "$ip" "password"
+                    fi
+                    msg "  ${D}Switched to password authentication${RS}"
+                    printf '  Password: '
+                    read -rs F5_PASS
+                    printf '\n\n'
+                    if [[ -z "$F5_PASS" ]]; then
+                        msg_err "Password required"
+                        return 1
+                    fi
+                    F5_SSH_KEY=""
+                    return 0
+                    ;;
+                c|C)
+                    return 1
+                    ;;
+                *)
+                    # Retry - continue loop
+                    ;;
+            esac
+        done
     fi
     
     # If stored auth type is password, prompt for password
@@ -685,22 +960,60 @@ prompt_credentials() {
     if [[ -z "$F5_PASS" ]]; then
         # Key auth - prompt for key path
         local default_key="$HOME/.ssh/id_rsa"
-        printf '  SSH Key [%s]: ' "$default_key"
-        read -r F5_SSH_KEY
-        [[ -z "$F5_SSH_KEY" ]] && F5_SSH_KEY="$default_key"
-        
-        # Expand ~ if present
-        F5_SSH_KEY="${F5_SSH_KEY/#\~/$HOME}"
-        
-        if [[ ! -f "$F5_SSH_KEY" ]]; then
+        while true; do
+            printf '  SSH Key [%s]: ' "$default_key"
+            read -r F5_SSH_KEY
+            [[ -z "$F5_SSH_KEY" ]] && F5_SSH_KEY="$default_key"
+
+            # Strip surrounding quotes (user may paste quoted path)
+            F5_SSH_KEY=$(_strip_quotes "$F5_SSH_KEY")
+
+            # Expand ~ if present
+            F5_SSH_KEY="${F5_SSH_KEY/#\~/$HOME}"
+
+            if [[ -f "$F5_SSH_KEY" ]]; then
+                msg "  ${D}Using SSH key: $F5_SSH_KEY${RS}"
+                break
+            fi
+
+            # Key not found - offer options
             msg_err "SSH key not found: $F5_SSH_KEY"
-            return 1
-        fi
-        
-        msg "  ${D}Using SSH key: $F5_SSH_KEY${RS}"
+            printf '\n'
+            printf '  %b[r]%b Retry with different path\n' "$BD" "$RS"
+            printf '  %b[p]%b Switch to password authentication\n' "$BD" "$RS"
+            printf '  %b[c]%b Cancel\n' "$D" "$RS"
+            printf '\n'
+            printf '  Choice [r/p/c]: '
+            local key_choice
+            read -r key_choice
+            case "$key_choice" in
+                p|P)
+                    # Switch to password auth
+                    if [[ -n "$ip" ]]; then
+                        db_update_auth "$ip" "password"
+                    fi
+                    msg "  ${D}Switched to password authentication${RS}"
+                    printf '  Password: '
+                    read -rs F5_PASS
+                    printf '\n'
+                    if [[ -z "$F5_PASS" ]]; then
+                        msg_err "Password required"
+                        return 1
+                    fi
+                    F5_SSH_KEY=""
+                    break
+                    ;;
+                c|C)
+                    return 1
+                    ;;
+                *)
+                    # Retry - continue loop
+                    ;;
+            esac
+        done
     fi
     printf '\n'
-    
+
     return 0
 }
 
@@ -754,17 +1067,20 @@ parse_date_to_ts() {
     return 1
 }
 
-# Calculate days until expiry
+# Calculate days until license expiry
+# Input: License End Date (not Service Check Date)
+# - Empty/null/N/A means perpetual license (device runs forever)
+# - Service Check Date is for upgrade eligibility, NOT license expiration (per K7727)
 calc_days_until() {
     local expiry="$1"
-    
-    # Handle special cases - empty or null means perpetual
+
+    # Handle special cases - empty or null means perpetual license
     if [[ -z "$expiry" || "$expiry" == "null" || "$expiry" == "N/A" ]]; then
         printf 'perpetual'
         return
     fi
-    
-    # Perpetual license indicators
+
+    # Perpetual license indicators (License End Date may contain these)
     case "$expiry" in
         [Pp]erpetual|[Uu]nlimited|[Nn]ever|[Nn]one)
             printf 'perpetual'
@@ -836,25 +1152,34 @@ run_with_timeout() {
 #-------------------------------------------------------------------------------
 f5_auth() {
     local ip="$1"
-    local timeout_sec="${2:-20}"
-    
+    local timeout_sec="${2:-$F5LM_REST_TIMEOUT}"
+
+    debug_curl "https://${ip}/mgmt/shared/authn/login" "POST"
+    verbose_msg "REST API auth to $ip (timeout: ${timeout_sec}s)"
+
     local user_escaped pass_escaped
     user_escaped=$(json_escape "$F5_USER")
     pass_escaped=$(json_escape "$F5_PASS")
-    
+
     local payload="{\"username\":\"${user_escaped}\",\"password\":\"${pass_escaped}\",\"loginProviderName\":\"tmos\"}"
-    
-    run_with_timeout "$timeout_sec" \
+
+    local result
+    result=$(run_with_timeout "$timeout_sec" \
         curl -sk -X POST "https://${ip}/mgmt/shared/authn/login" \
         -H "Content-Type: application/json" \
-        -d "$payload" 2>/dev/null
+        -d "$payload" 2>/dev/null)
+    debug_log "Auth result: ${result:0:100}..."
+    echo "$result"
 }
 
 f5_get_license() {
     local ip="$1"
     local token="$2"
-    local timeout_sec="${3:-20}"
-    
+    local timeout_sec="${3:-$F5LM_REST_TIMEOUT}"
+
+    debug_curl "https://${ip}/mgmt/tm/sys/license" "GET"
+    verbose_msg "Getting license from $ip"
+
     run_with_timeout "$timeout_sec" \
         curl -sk "https://${ip}/mgmt/tm/sys/license" \
         -H "X-F5-Auth-Token: $token" 2>/dev/null
@@ -895,6 +1220,11 @@ f5_install_license() {
 # Parse license JSON response
 parse_license_info() {
     local json="$1"
+    # Return format: regkey|license_end_date
+    # Use License End Date for expiration tracking (per K7727, K000151595)
+    # License End Date is when the license actually expires (subscription/eval/trial)
+    # Empty/null/N/A means perpetual license (device runs forever)
+    # Note: Service Check Date is only for upgrade eligibility, NOT license expiration
     printf '%s' "$json" | jq -r '
         .entries | to_entries[] | select(.key | contains("/license/")) |
         .value.nestedStats.entries |
@@ -922,21 +1252,23 @@ ssh_has_key_auth() {
     local user="${F5_USER:-root}"
     local key_opts=""
     
-    # Add custom key if specified
-    if [[ -n "$F5_SSH_KEY" && -f "$F5_SSH_KEY" ]]; then
-        key_opts="-i $F5_SSH_KEY"
-    fi
-    
     # Try SSH with BatchMode (fails immediately if key auth not available)
     # Using a short timeout and checking exit status
-    ssh -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -o LogLevel=ERROR \
-        -o ConnectTimeout=5 \
-        -o BatchMode=yes \
-        -o PasswordAuthentication=no \
-        $key_opts \
-        "$user@$ip" "echo ok" 2>/dev/null
+    local ssh_args=(
+        -o StrictHostKeyChecking=no
+        -o UserKnownHostsFile=/dev/null
+        -o LogLevel=ERROR
+        -o ConnectTimeout=5
+        -o BatchMode=yes
+        -o PasswordAuthentication=no
+    )
+
+    # Add custom key if specified (properly quoted)
+    if [[ -n "$F5_SSH_KEY" && -f "$F5_SSH_KEY" ]]; then
+        ssh_args+=(-i "$F5_SSH_KEY")
+    fi
+
+    ssh "${ssh_args[@]}" "$user@$ip" "echo ok" 2>/dev/null
     
     return $?
 }
@@ -955,7 +1287,7 @@ ssh_test_key_auth() {
 # Get SSH options based on auth mode
 # Returns options as an array-safe string
 _ssh_get_opts() {
-    echo "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10"
+    echo "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=$F5LM_CONNECT_TIMEOUT"
 }
 
 # Get SSH key option if key is specified
@@ -981,15 +1313,19 @@ _ssh_get_key_opt() {
 _f5_ssh_cmd() {
     local ip="$1"
     local cmd="$2"
-    local timeout_sec="${3:-15}"
-    
-    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o BatchMode=yes -o PasswordAuthentication=no"
-    
+    local timeout_sec="${3:-$F5LM_SSH_TIMEOUT}"
+
+    debug_ssh "$cmd" "$ip"
+    verbose_msg "SSH to $ip: $cmd (timeout: ${timeout_sec}s)"
+
+    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=$F5LM_CONNECT_TIMEOUT -o BatchMode=yes -o PasswordAuthentication=no"
+
     local result=""
     local rc=0
-    
+
     if command -v timeout >/dev/null 2>&1; then
         if [[ -n "$F5_SSH_KEY" && -f "$F5_SSH_KEY" ]]; then
+            debug_log "Using SSH key: $F5_SSH_KEY"
             result=$(timeout "$timeout_sec" ssh $ssh_opts -i "$F5_SSH_KEY" "$F5_USER@$ip" "$cmd" 2>&1)
             rc=$?
         else
@@ -998,6 +1334,7 @@ _f5_ssh_cmd() {
         fi
     else
         if [[ -n "$F5_SSH_KEY" && -f "$F5_SSH_KEY" ]]; then
+            debug_log "Using SSH key: $F5_SSH_KEY"
             result=$(ssh $ssh_opts -i "$F5_SSH_KEY" "$F5_USER@$ip" "$cmd" 2>&1)
             rc=$?
         else
@@ -1005,7 +1342,9 @@ _f5_ssh_cmd() {
             rc=$?
         fi
     fi
-    
+
+    debug_log "SSH result (rc=$rc): ${result:0:200}"
+
     # Filter out SSH warnings/errors from result, but keep command output
     echo "$result" | grep -v "^Warning:" | grep -v "^Permission denied"
     return $rc
@@ -1015,9 +1354,9 @@ _f5_ssh_cmd() {
 _f5_ssh_cmd_pass() {
     local ip="$1"
     local cmd="$2"
-    local timeout_sec="${3:-15}"
-    
-    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10"
+    local timeout_sec="${3:-$F5LM_SSH_TIMEOUT}"
+
+    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=$F5LM_CONNECT_TIMEOUT"
     
     local result=""
     local rc=0
@@ -1204,34 +1543,44 @@ show_stats() {
 show_devices() {
     local count
     count=$(db_count)
-    
+
+    # JSON output mode
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        if [[ "$count" -eq 0 || "$count" == "0" ]]; then
+            printf '{"devices":[],"count":0}\n'
+        else
+            jq -c '{devices: ., count: length}' "$DB_FILE" 2>/dev/null
+        fi
+        return
+    fi
+
     printf '  %bDEVICES%b\n' "$BD" "$RS"
     printf '\n'
-    
+
     if [[ "$count" -eq 0 || "$count" == "0" ]]; then
         printf '  %bNo devices yet. Use %badd <ip>%b to add one.%b\n' "$D" "$RS" "$D" "$RS"
         printf '\n'
         return
     fi
-    
+
     printf '  %b%-3s %-18s %-14s %-10s %-12s%b\n' "$D" "#" "IP ADDRESS" "EXPIRES" "DAYS" "STATUS" "$RS"
     draw_line 60
-    
+
     local i=0
     while [[ "$i" -lt "$count" ]]; do
         local ip expires days status
         local status_sym status_color days_display
-        
+
         ip=$(jq -r ".[$i].ip // \"\"" "$DB_FILE" 2>/dev/null)
         expires=$(jq -r ".[$i].expires // \"-\"" "$DB_FILE" 2>/dev/null)
         days=$(jq -r ".[$i].days // \"?\"" "$DB_FILE" 2>/dev/null)
         status=$(jq -r ".[$i].status // \"new\"" "$DB_FILE" 2>/dev/null)
-        
+
         # Handle null strings
         [[ "$expires" == "null" ]] && expires="-"
         [[ "$days" == "null" ]] && days="?"
         [[ "$status" == "null" ]] && status="new"
-        
+
         # Status formatting
         case "$status" in
             perpetual) status_sym="$SYM_OK"; status_color="$G"; days_display="∞" ;;
@@ -1240,10 +1589,10 @@ show_devices() {
             expired)   status_sym="$SYM_ERR"; status_color="$R"; days_display="$days" ;;
             *)         status_sym="$SYM_PENDING"; status_color="$D"; days_display="?" ;;
         esac
-        
+
         printf '  %-3s %-18s %-14s %-10s %b%s %s%b\n' \
             "$((i+1))" "$ip" "${expires:--}" "$days_display" "$status_color" "$status_sym" "$status" "$RS"
-        
+
         i=$((i + 1))
     done
     printf '\n'
@@ -1298,6 +1647,27 @@ cmd_help() {
     printf '    %bF5_PASS_10_0_0_1%b      Password for 10.0.0.1\n' "$BD" "$RS"
     printf '    %bF5_SSH_KEY_10_0_0_1%b   SSH key for 10.0.0.1\n' "$BD" "$RS"
     printf '\n'
+    printf '  %bGlobal Options%b\n' "$C" "$RS"
+    printf '    %b--verbose%b             Enable verbose output (logs to ~/.f5lm/logs/)\n' "$BD" "$RS"
+    printf '    %b--debug%b               Enable debug mode (verbose + stderr output)\n' "$BD" "$RS"
+    printf '    %b--completions%b SHELL   Generate shell completions (bash or zsh)\n' "$BD" "$RS"
+    printf '    %bF5LM_VERBOSE%b          Set to 1 (verbose) or 2 (debug) via env var\n' "$BD" "$RS"
+    printf '\n'
+    printf '  %bTimeout Configuration%b (environment variables)\n' "$C" "$RS"
+    printf '    %bF5LM_SSH_TIMEOUT%b      SSH command timeout in seconds (default: 15)\n' "$BD" "$RS"
+    printf '    %bF5LM_REST_TIMEOUT%b     REST API timeout in seconds (default: 20)\n' "$BD" "$RS"
+    printf '    %bF5LM_CONNECT_TIMEOUT%b  SSH connect timeout in seconds (default: 10)\n' "$BD" "$RS"
+    printf '\n'
+    printf '  %bConfiguration File%b (~/.f5lm/config)\n' "$C" "$RS"
+    printf '    Persistent settings. Environment variables take precedence.\n'
+    printf '    %bF5LM_DEFAULT_USER%b     Default username for all devices\n' "$BD" "$RS"
+    printf '    %bF5LM_SSH_KEY%b          Default path to SSH private key\n' "$BD" "$RS"
+    printf '    %bF5LM_SSH_TIMEOUT%b      SSH command timeout\n' "$BD" "$RS"
+    printf '    %bF5LM_REST_TIMEOUT%b     REST API timeout\n' "$BD" "$RS"
+    printf '    %bF5LM_CONNECT_TIMEOUT%b  SSH connect timeout\n' "$BD" "$RS"
+    printf '    %bF5LM_VERBOSE%b          Verbosity level (1=verbose, 2=debug)\n' "$BD" "$RS"
+    printf '    %bF5LM_NO_COLOR%b         Disable colors (1, true, or yes)\n' "$BD" "$RS"
+    printf '\n'
 }
 
 #-------------------------------------------------------------------------------
@@ -1330,23 +1700,24 @@ _get_license_via_ssh() {
     local regkey=""
     regkey=$(echo "$lic_output" | grep -i "Registration Key" | awk '{print $NF}' | head -1)
 
-    # Parse expiration date - look for "License End Date" specifically
-    # "Service Check Date" is NOT the expiration date - it's the entitlement check date
-    # If no "License End Date" exists, the license is perpetual
-    local expires=""
-    expires=$(echo "$lic_output" | grep -i "License End Date" | awk '{print $NF}' | head -1)
+    # Parse License End Date for expiration tracking (per K7727, K000151595)
+    # License End Date is when the license actually expires (subscription/eval/trial)
+    # Empty/null/N/A means perpetual license (device runs forever)
+    # Note: Service Check Date is only for upgrade eligibility, NOT license expiration
+    local license_end=""
+    license_end=$(echo "$lic_output" | grep -i "License End Date" | awk '{print $NF}' | head -1)
 
-    # If no License End Date found, try license file directly
-    if [[ -z "$expires" ]]; then
-        local expires_output
-        expires_output=$(_f5_ssh_cmd "$ip" "grep -i 'License end' /config/bigip.license" 10)
-        expires=$(echo "$expires_output" | sed 's/.*[Ll]icense [Ee]nd[^:]*[: ]*//' | awk '{print $1}')
+    # If no License End Date found in tmsh output, try license file directly
+    if [[ -z "$license_end" ]]; then
+        local license_output
+        license_output=$(_f5_ssh_cmd "$ip" "grep -i 'License end date' /config/bigip.license" 10)
+        license_end=$(echo "$license_output" | sed 's/.*[Ll]icense [Ee]nd [Dd]ate[^:]*[: ]*//' | awk '{print $1}')
     fi
 
-    # If still no expiration found, it's a perpetual license - leave expires empty
-    
-    # Return in format: regkey|expires
-    echo "${regkey}|${expires}"
+    # If still no License End Date found, leave empty (means perpetual license)
+
+    # Return in format: regkey|license_end_date
+    echo "${regkey}|${license_end}"
 }
 
 # Internal function to check a single device (no credential prompt)
@@ -1491,25 +1862,36 @@ cmd_add() {
 
     if [[ "$use_env_creds" -eq 0 ]]; then
         # No valid env credentials - prompt interactively
-        printf '\n'
-        printf '  %bSSH Authentication for %b%s%b\n' "$C" "$BD" "$ip" "$RS"
-        printf '\n'
-        printf '  %b[1]%b SSH Key (passwordless)\n' "$BD" "$RS"
-        printf '  %b[2]%b Password\n' "$BD" "$RS"
-        printf '\n'
-        printf '  Auth type [1/2]: '
-        local auth_choice
-        read -r auth_choice
+        while true; do
+            printf '\n'
+            printf '  %bSSH Authentication for %b%s%b\n' "$C" "$BD" "$ip" "$RS"
+            printf '\n'
+            printf '  %b[1]%b SSH Key (passwordless)\n' "$BD" "$RS"
+            printf '  %b[2]%b Password\n' "$BD" "$RS"
+            printf '  %b[q]%b Cancel\n' "$D" "$RS"
+            printf '\n'
+            printf '  Auth type [1/2/q]: '
+            local auth_choice
+            read -r auth_choice
 
-        case "$auth_choice" in
-            2)
-                auth_type="password"
-                ;;
-            *)
-                auth_type="key"
-                ;;
-        esac
-
+            case "$auth_choice" in
+                q|Q|quit|cancel)
+                    msg "  ${D}Cancelled${RS}"
+                    return 1
+                    ;;
+                2)
+                    auth_type="password"
+                    break
+                    ;;
+                1|"")
+                    auth_type="key"
+                    break
+                    ;;
+                *)
+                    msg_warn "Invalid choice. Enter 1, 2, or q"
+                    ;;
+            esac
+        done
         printf '\n'
     fi
 
@@ -1541,23 +1923,61 @@ cmd_add() {
 
         if [[ "$auth_type" == "key" ]]; then
             F5_PASS=""
-            # Prompt for SSH key path
+            # Prompt for SSH key path with retry loop
             local default_key="$HOME/.ssh/id_rsa"
-            printf '  SSH Key [%s]: ' "$default_key"
-            read -r F5_SSH_KEY
-            [[ -z "$F5_SSH_KEY" ]] && F5_SSH_KEY="$default_key"
+            while true; do
+                printf '  SSH Key [%s]: ' "$default_key"
+                read -r F5_SSH_KEY
+                [[ -z "$F5_SSH_KEY" ]] && F5_SSH_KEY="$default_key"
 
-            # Expand ~ if present
-            F5_SSH_KEY="${F5_SSH_KEY/#\~/$HOME}"
+                # Strip surrounding quotes (user may paste quoted path)
+                F5_SSH_KEY=$(_strip_quotes "$F5_SSH_KEY")
 
-            if [[ ! -f "$F5_SSH_KEY" ]]; then
+                # Expand ~ if present
+                F5_SSH_KEY="${F5_SSH_KEY/#\~/$HOME}"
+
+                if [[ -f "$F5_SSH_KEY" ]]; then
+                    msg "  ${D}Using SSH key: $F5_SSH_KEY${RS}"
+                    break
+                fi
+
+                # Key not found - offer options
                 msg_err "SSH key not found: $F5_SSH_KEY"
-                printf '      %bRun "check %s" to fetch license info%b\n' "$D" "$ip" "$RS"
-                F5_USER="" F5_PASS="" F5_SSH_KEY=""
-                return 0
-            fi
-
-            msg "  ${D}Using SSH key: $F5_SSH_KEY${RS}"
+                printf '\n'
+                printf '  %b[r]%b Retry with different path\n' "$BD" "$RS"
+                printf '  %b[p]%b Switch to password authentication\n' "$BD" "$RS"
+                printf '  %b[s]%b Skip credential check for now\n' "$BD" "$RS"
+                printf '\n'
+                printf '  Choice [r/p/s]: '
+                local key_choice
+                read -r key_choice
+                case "$key_choice" in
+                    p|P)
+                        # Switch to password auth
+                        auth_type="password"
+                        db_update_auth "$ip" "password"
+                        msg "  ${D}Switched to password authentication${RS}"
+                        printf '  Password: '
+                        read -rs F5_PASS
+                        printf '\n'
+                        if [[ -z "$F5_PASS" ]]; then
+                            printf '      %bRun "check %s" to fetch license info%b\n' "$D" "$ip" "$RS"
+                            F5_USER="" F5_PASS="" F5_SSH_KEY=""
+                            return 0
+                        fi
+                        F5_SSH_KEY=""
+                        break
+                        ;;
+                    s|S)
+                        printf '      %bRun "check %s" to fetch license info%b\n' "$D" "$ip" "$RS"
+                        F5_USER="" F5_PASS="" F5_SSH_KEY=""
+                        return 0
+                        ;;
+                    *)
+                        # Retry - continue loop
+                        ;;
+                esac
+            done
         else
             printf '  Password: '
             read -rs F5_PASS
@@ -1573,7 +1993,54 @@ cmd_add() {
         # Now show checking message and perform check
         printf '\n'
         msg_info "Checking license status..."
-        _check_single_device "$ip"
+
+        if ! _check_single_device "$ip"; then
+            # Check failed - if using SSH key auth, offer to switch to password
+            if [[ "$auth_type" == "key" ]]; then
+                printf '\n'
+                printf '  %bSSH authentication failed. What would you like to do?%b\n' "$Y" "$RS"
+                printf '\n'
+                printf '  %b[p]%b Switch to password authentication and retry\n' "$BD" "$RS"
+                printf '  %b[s]%b Skip - keep device, check later\n' "$BD" "$RS"
+                printf '  %b[r]%b Remove device\n' "$D" "$RS"
+                printf '\n'
+                printf '  Choice [p/s/r]: '
+                local retry_choice
+                read -r retry_choice
+
+                case "$retry_choice" in
+                    p|P)
+                        # Switch to password auth
+                        auth_type="password"
+                        db_update_auth "$ip" "password"
+                        F5_SSH_KEY=""
+                        msg "  ${D}Switched to password authentication${RS}"
+                        printf '  Password: '
+                        read -rs F5_PASS
+                        printf '\n'
+
+                        if [[ -n "$F5_PASS" ]]; then
+                            printf '\n'
+                            msg_info "Retrying with password authentication..."
+                            _check_single_device "$ip"
+                        else
+                            printf '      %bRun "check %s" to fetch license info%b\n' "$D" "$ip" "$RS"
+                        fi
+                        ;;
+                    r|R)
+                        # Remove device
+                        db_remove "$ip"
+                        msg "  ${D}Device removed${RS}"
+                        F5_USER="" F5_PASS="" F5_SSH_KEY=""
+                        return 0
+                        ;;
+                    *)
+                        # Skip - keep device
+                        printf '      %bRun "check %s" to fetch license info%b\n' "$D" "$ip" "$RS"
+                        ;;
+                esac
+            fi
+        fi
 
         # Clear credentials after check
         F5_USER="" F5_PASS="" F5_SSH_KEY=""
@@ -1795,7 +2262,22 @@ cmd_list() {
 cmd_check() {
     local target="${1:-all}"
     local ips=""
-    
+
+    # JSON output mode - returns current database state without re-checking
+    # For live checks, run without --json flag first, then use --json list
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        if [[ "$target" == "all" ]]; then
+            jq -c '{devices: ., count: length}' "$DB_FILE" 2>/dev/null
+        else
+            if ! db_exists "$target"; then
+                printf '{"error":"Device not found","ip":"%s"}\n' "$target"
+                return 1
+            fi
+            jq -c --arg ip "$target" '.[] | select(.ip == $ip)' "$DB_FILE" 2>/dev/null
+        fi
+        return 0
+    fi
+
     if [[ "$target" == "all" ]]; then
         ips=$(jq -r '.[]?.ip // empty' "$DB_FILE" 2>/dev/null)
         if [[ -z "$ips" ]]; then
@@ -1809,7 +2291,7 @@ cmd_check() {
         fi
         ips="$target"
     fi
-    
+
     printf '\n'
     printf '  %bCHECKING LICENSES%b\n' "$BD" "$RS"
     printf '\n'
@@ -2150,7 +2632,7 @@ cmd_details() {
         lic_output=$(_get_license_details_via_ssh "$ip")
         
         if [[ -z "$lic_output" ]]; then
-            msg_err "SSH connection failed"
+            msg_err_hint "SSH connection failed to $ip" "ssh_connect"
             return 1
         fi
         
@@ -2162,7 +2644,7 @@ cmd_details() {
         platform=$(echo "$lic_output" | grep -i "Platform ID" | awk '{print $NF}' | head -1)
         
         if [[ -z "$regkey" && -z "$expires" ]]; then
-            msg_err "Could not parse license from SSH output"
+            msg_err_hint "Could not parse license from SSH output" "license_parse"
             return 1
         fi
     else
@@ -2172,10 +2654,10 @@ cmd_details() {
         token=$(printf '%s' "$auth_resp" | jq -r '.token.token // empty' 2>/dev/null)
         
         if [[ -z "$token" ]]; then
-            msg_err "Authentication failed"
+            msg_err_hint "REST API authentication failed for $ip" "rest_auth"
             return 1
         fi
-        
+
         local lic_json
         lic_json=$(f5_get_license "$ip" "$token")
         
@@ -2199,13 +2681,41 @@ cmd_details() {
         licensed=$(printf '%s' "$info" | grep '^licensed:' | cut -d: -f2-)
         platform=$(printf '%s' "$info" | grep '^platform:' | cut -d: -f2-)
     fi
-    
+
+    # Use License End Date for expiration tracking (per K7727, K000151595)
+    # License End Date is when the license actually expires (subscription/eval/trial)
+    # Empty/null/N/A means perpetual license (device runs forever)
+    # Note: Service Check Date is only for upgrade eligibility, NOT license expiration
     local days status
     days=$(calc_days_until "$expires")
     status=$(get_status_from_days "$days")
-    
+
     db_update "$ip" "$expires" "$days" "$status" "$regkey"
-    
+
+    # JSON output mode
+    if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+        jq -n \
+            --arg ip "$ip" \
+            --arg status "$status" \
+            --arg days "$days" \
+            --arg service "${service:-}" \
+            --arg expires "${expires:-}" \
+            --arg licensed "${licensed:-}" \
+            --arg platform "${platform:-}" \
+            --arg regkey "${regkey:-}" \
+            '{
+                ip: $ip,
+                status: $status,
+                days: (if $days == "perpetual" then "perpetual" else ($days | tonumber? // $days) end),
+                service_check_date: (if $service == "" then null else $service end),
+                license_end_date: (if $expires == "" then null else $expires end),
+                licensed_on: (if $licensed == "" then null else $licensed end),
+                platform: (if $platform == "" then null else $platform end),
+                regkey: (if $regkey == "" then null else $regkey end)
+            }'
+        return 0
+    fi
+
     local status_display days_display
     case "$status" in
         perpetual)
@@ -2229,7 +2739,7 @@ cmd_details() {
             days_display="?"
             ;;
     esac
-    
+
     printf '\n'
     printf '  %bLICENSE DETAILS%b\n' "$BD" "$RS"
     printf '\n'
@@ -2237,8 +2747,8 @@ cmd_details() {
     printf '  | %-14s %-45s |\n' "IP:" "$ip"
     printf '  | %-14s %-45b |\n' "Status:" "$status_display ($days_display)"
     printf '  +--------------------------------------------------------------+\n'
-    printf '  | %-14s %-45s |\n' "Expires:" "${expires:-Perpetual}"
-    printf '  | %-14s %-45s |\n' "Service Date:" "${service:-N/A}"
+    printf '  | %-14s %-45s |\n' "License End:" "${expires:-Perpetual} (used for expiration)"
+    printf '  | %-14s %-45s |\n' "Svc Check:" "${service:-N/A} (upgrade eligibility)"
     printf '  | %-14s %-45s |\n' "Licensed On:" "${licensed:-N/A}"
     printf '  | %-14s %-45s |\n' "Platform:" "${platform:-N/A}"
     printf '  +--------------------------------------------------------------+\n'
@@ -2312,12 +2822,12 @@ cmd_renew() {
         local auth_resp token
         auth_resp=$(f5_auth "$ip")
         token=$(printf '%s' "$auth_resp" | jq -r '.token.token // empty' 2>/dev/null)
-        
+
         if [[ -z "$token" ]]; then
-            msg_err "Authentication failed"
+            msg_err_hint "REST API authentication failed for $ip" "rest_auth"
             return 1
         fi
-        
+
         msg_info "Installing license..."
         
         local result
@@ -2371,22 +2881,40 @@ cmd_reload() {
     msg_info "Reloading license on $ip..."
     
     local result rc
-    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15"
+    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=$F5LM_CONNECT_TIMEOUT"
     
+    # reloadlic is a bash command - may need bash -c wrapper if user lands in TMOS shell
+    # Try direct command first, fallback to bash -c if it fails (TMOS compatibility)
     if [[ -z "$F5_PASS" ]]; then
         # Key-based authentication
         msg "  ${D}Using SSH key authentication${RS}"
         if [[ -n "$F5_SSH_KEY" && -f "$F5_SSH_KEY" ]]; then
             result=$(ssh $ssh_opts -o BatchMode=yes -o PasswordAuthentication=no -i "$F5_SSH_KEY" "$F5_USER@$ip" "reloadlic" 2>&1)
+            rc=$?
+            # If failed (might be in TMOS), try via bash explicitly
+            if [[ $rc -ne 0 ]] || echo "$result" | grep -qi "syntax error\|unknown\|not found"; then
+                result=$(ssh $ssh_opts -o BatchMode=yes -o PasswordAuthentication=no -i "$F5_SSH_KEY" "$F5_USER@$ip" "bash -c 'reloadlic'" 2>&1)
+                rc=$?
+            fi
         else
             result=$(ssh $ssh_opts -o BatchMode=yes -o PasswordAuthentication=no "$F5_USER@$ip" "reloadlic" 2>&1)
+            rc=$?
+            # If failed (might be in TMOS), try via bash explicitly
+            if [[ $rc -ne 0 ]] || echo "$result" | grep -qi "syntax error\|unknown\|not found"; then
+                result=$(ssh $ssh_opts -o BatchMode=yes -o PasswordAuthentication=no "$F5_USER@$ip" "bash -c 'reloadlic'" 2>&1)
+                rc=$?
+            fi
         fi
-        rc=$?
     elif ssh_has_sshpass; then
         # Password authentication with sshpass (non-interactive)
         msg "  ${D}Using password authentication${RS}"
         result=$(sshpass -p "$F5_PASS" ssh $ssh_opts "$F5_USER@$ip" "reloadlic" 2>&1)
         rc=$?
+        # If failed (might be in TMOS), try via bash explicitly
+        if [[ $rc -ne 0 ]] || echo "$result" | grep -qi "syntax error\|unknown\|not found"; then
+            result=$(sshpass -p "$F5_PASS" ssh $ssh_opts "$F5_USER@$ip" "bash -c 'reloadlic'" 2>&1)
+            rc=$?
+        fi
     else
         # Password authentication without sshpass - run interactively
         msg "  ${D}Using password authentication (interactive)${RS}"
@@ -2394,6 +2922,12 @@ cmd_reload() {
         printf '\n'
         ssh $ssh_opts "$F5_USER@$ip" "reloadlic"
         rc=$?
+        # If failed, try via bash explicitly
+        if [[ $rc -ne 0 ]]; then
+            msg "  ${D}Retrying with bash wrapper...${RS}"
+            ssh $ssh_opts "$F5_USER@$ip" "bash -c 'reloadlic'"
+            rc=$?
+        fi
         result=""
     fi
     
@@ -2551,14 +3085,14 @@ _ssh_start_control() {
     local control_path
     control_path=$(_ssh_control_path "$ip")
     
-    local ssh_base_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10"
+    local ssh_base_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=$F5LM_CONNECT_TIMEOUT"
     ssh_base_opts="$ssh_base_opts -o ControlMaster=yes -o ControlPath=$control_path -o ControlPersist=60"
     
     # Determine auth method and start control master
     # Use timeout to prevent hanging
     local timeout_cmd=""
     if command -v timeout >/dev/null 2>&1; then
-        timeout_cmd="timeout 15"
+        timeout_cmd="timeout $F5LM_SSH_TIMEOUT"
     fi
     
     local rc=0
@@ -2672,7 +3206,7 @@ _apply_license_to_device() {
     local remote_file="/config/bigip.license"
     local backup_file="/var/tmp/bigip.license.backup.$(date +%Y%m%d_%H%M%S)"
     
-    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15"
+    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=$F5LM_CONNECT_TIMEOUT"
     local scp_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
     
     # Create temp file with license content
@@ -2686,31 +3220,37 @@ _apply_license_to_device() {
         # Key-based authentication
         msg "  ${D}Using SSH key authentication${RS}"
         
-        local key_opt=""
-        [[ -n "$F5_SSH_KEY" && -f "$F5_SSH_KEY" ]] && key_opt="-i $F5_SSH_KEY"
-        
+        local key_args=()
+        [[ -n "$F5_SSH_KEY" && -f "$F5_SSH_KEY" ]] && key_args=(-i "$F5_SSH_KEY")
+
         # Backup existing license
         msg_info "Backing up existing license..."
-        ssh $ssh_opts -o BatchMode=yes -o PasswordAuthentication=no $key_opt "$F5_USER@$ip" \
+        ssh $ssh_opts -o BatchMode=yes -o PasswordAuthentication=no "${key_args[@]}" "$F5_USER@$ip" \
             "cp $remote_file $backup_file 2>/dev/null || true" 2>/dev/null
         msg "  ${D}Backup: $backup_file${RS}"
-        
+
         # Upload license
         msg_info "Writing license to device..."
-        if ! scp $scp_opts -o BatchMode=yes -o PasswordAuthentication=no $key_opt "$temp_file" "$F5_USER@$ip:$remote_file" 2>/dev/null; then
+        if ! scp $scp_opts -o BatchMode=yes -o PasswordAuthentication=no "${key_args[@]}" "$temp_file" "$F5_USER@$ip:$remote_file" 2>/dev/null; then
             rm -f "$temp_file" 2>/dev/null
             msg_err "Failed to write license file"
             return 1
         fi
         rm -f "$temp_file" 2>/dev/null
-        
+
         msg_ok "License written to device"
-        
-        # Reload license
+
+        # Reload license (bash command - try direct first, then bash -c for TMOS compatibility)
         printf '\n'
         msg_info "Reloading license configuration..."
-        ssh $ssh_opts -o BatchMode=yes -o PasswordAuthentication=no $key_opt "$F5_USER@$ip" "reloadlic" 2>/dev/null
-        
+        local reload_result
+        reload_result=$(ssh $ssh_opts -o BatchMode=yes -o PasswordAuthentication=no "${key_args[@]}" "$F5_USER@$ip" "reloadlic" 2>&1)
+        local reload_rc=$?
+        # If failed (might be in TMOS), try via bash explicitly
+        if [[ $reload_rc -ne 0 ]] || echo "$reload_result" | grep -qi "syntax error\|unknown\|not found"; then
+            ssh $ssh_opts -o BatchMode=yes -o PasswordAuthentication=no "${key_args[@]}" "$F5_USER@$ip" "bash -c 'reloadlic'" 2>/dev/null
+        fi
+
     elif ssh_has_sshpass; then
         # Password authentication with sshpass
         msg "  ${D}Using password authentication${RS}"
@@ -2731,12 +3271,18 @@ _apply_license_to_device() {
         rm -f "$temp_file" 2>/dev/null
         
         msg_ok "License written to device"
-        
-        # Reload license
+
+        # Reload license (bash command - try direct first, then bash -c for TMOS compatibility)
         printf '\n'
         msg_info "Reloading license configuration..."
-        sshpass -p "$F5_PASS" ssh $ssh_opts "$F5_USER@$ip" "reloadlic" 2>/dev/null
-        
+        local reload_result
+        reload_result=$(sshpass -p "$F5_PASS" ssh $ssh_opts "$F5_USER@$ip" "reloadlic" 2>&1)
+        local reload_rc=$?
+        # If failed (might be in TMOS), try via bash explicitly
+        if [[ $reload_rc -ne 0 ]] || echo "$reload_result" | grep -qi "syntax error\|unknown\|not found"; then
+            sshpass -p "$F5_PASS" ssh $ssh_opts "$F5_USER@$ip" "bash -c 'reloadlic'" 2>/dev/null
+        fi
+
     else
         # Password authentication without sshpass - run interactively
         msg "  ${D}Using password authentication (interactive)${RS}"
@@ -2758,14 +3304,21 @@ _apply_license_to_device() {
         rm -f "$temp_file" 2>/dev/null
         
         msg_ok "License written to device"
-        
-        # Reload license
+
+        # Reload license (bash command - try direct first, then bash -c for TMOS compatibility)
         printf '\n'
         msg_info "Reloading license configuration..."
         ssh $ssh_opts "$F5_USER@$ip" "reloadlic"
+        local reload_rc=$?
+        # If failed (might be in TMOS), try via bash explicitly
+        if [[ $reload_rc -ne 0 ]]; then
+            msg "  ${D}Retrying with bash wrapper...${RS}"
+            ssh $ssh_opts "$F5_USER@$ip" "bash -c 'reloadlic'"
+            reload_rc=$?
+        fi
     fi
-    
-    if [[ $? -eq 0 ]]; then
+
+    if [[ ${reload_rc:-$?} -eq 0 ]]; then
         msg_ok "License reload initiated"
         return 0
     else
@@ -2917,7 +3470,7 @@ cmd_dossier() {
         fi
         
         if [[ -z "$dossier" ]]; then
-            msg_err "SSH dossier generation failed"
+            msg_err_hint "SSH dossier generation failed for $ip" "ssh_connect"
             return 1
         fi
         msg_ok "Dossier generated via SSH"
@@ -2926,9 +3479,9 @@ cmd_dossier() {
         local auth_resp token
         auth_resp=$(f5_auth "$ip")
         token=$(printf '%s' "$auth_resp" | jq -r '.token.token // empty' 2>/dev/null)
-        
+
         if [[ -z "$token" ]]; then
-            msg_err "Authentication failed"
+            msg_err_hint "REST API authentication failed for $ip" "rest_auth"
             return 1
         fi
         
@@ -2971,15 +3524,15 @@ cmd_dossier() {
             
             msg_info "Trying SSH method..."
             
-            local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15"
+            local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=$F5LM_CONNECT_TIMEOUT"
             local dossier_output=""
             
             if [[ -z "$F5_PASS" ]]; then
                 # Key auth (should have been handled above, but fallback)
                 msg "  ${D}Using SSH key authentication${RS}"
-                local key_opt=""
-                [[ -n "$F5_SSH_KEY" && -f "$F5_SSH_KEY" ]] && key_opt="-i $F5_SSH_KEY"
-                dossier_output=$(ssh $ssh_opts -o BatchMode=yes -o PasswordAuthentication=no $key_opt "$F5_USER@$ip" "get_dossier -b $regkey" 2>/dev/null)
+                local key_args=()
+                [[ -n "$F5_SSH_KEY" && -f "$F5_SSH_KEY" ]] && key_args=(-i "$F5_SSH_KEY")
+                dossier_output=$(ssh $ssh_opts -o BatchMode=yes -o PasswordAuthentication=no "${key_args[@]}" "$F5_USER@$ip" "get_dossier -b $regkey" 2>/dev/null)
             elif ssh_has_sshpass; then
                 # Password auth with sshpass
                 msg "  ${D}Using password authentication${RS}"
@@ -2998,7 +3551,7 @@ cmd_dossier() {
             fi
             
             if [[ -z "$dossier" ]]; then
-                msg_err "SSH dossier generation failed"
+                msg_err "SSH dossier generation failed (see manual steps below)"
                 printf '\n'
                 printf '  %bMANUAL DOSSIER GENERATION%b\n' "$BD" "$RS"
                 printf '\n'
@@ -3363,24 +3916,56 @@ interactive_mode() {
 # MAIN
 #-------------------------------------------------------------------------------
 main() {
+    # Parse global flags first (before any setup)
+    local args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --verbose)
+                VERBOSE=1
+                shift
+                ;;
+            --debug)
+                VERBOSE=2
+                shift
+                ;;
+            --json)
+                JSON_OUTPUT=1
+                shift
+                ;;
+            *)
+                args+=("$1")
+                shift
+                ;;
+        esac
+    done
+    set -- "${args[@]}"
+
     # Pre-flight checks
     check_bash_version
-    
+
     # Detect environment
     detect_platform
     detect_terminal
-    
+
     # Setup
     setup_colors
     setup_symbols
     setup_data_dir
-    
+
+    # Initialize debug logging (after data dir is set up)
+    init_debug_log
+
+    # Load configuration file (after data dir, before dependencies)
+    load_config
+
     # Check dependencies
     check_dependencies
-    
+
     # Initialize data
     init_data
-    
+
+    debug_log "Initialization complete"
+
     # Handle arguments
     if [[ $# -eq 0 ]]; then
         interactive_mode
@@ -3389,16 +3974,151 @@ main() {
             -v|--version)
                 printf '%s v%s\n' "$F5LM_NAME" "$F5LM_VERSION"
                 printf 'Platform: %s | Bash: %s\n' "$PLATFORM" "$BASH_VERSION"
+                [[ "$VERBOSE" -ge 1 ]] && printf 'Verbose: %d | Log: %s\n' "$VERBOSE" "${DEBUG_LOG_FILE:-none}"
                 ;;
             -h|--help)
                 show_header
                 cmd_help
+                ;;
+            --completions)
+                generate_completions "${2:-bash}"
                 ;;
             *)
                 run_command "$*"
                 ;;
         esac
     fi
+}
+
+#-------------------------------------------------------------------------------
+# SHELL COMPLETION GENERATION
+#-------------------------------------------------------------------------------
+generate_completions() {
+    local shell_type="${1:-bash}"
+
+    case "$shell_type" in
+        bash)
+            cat << 'BASH_COMPLETION'
+# Bash completion for f5lm (F5 License Manager)
+# Install: f5-license.sh --completions bash >> ~/.bash_completion
+#      or: f5-license.sh --completions bash > /etc/bash_completion.d/f5lm
+
+_f5lm_completions() {
+    local cur prev commands devices
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+    # Main commands
+    commands="add add-multi remove list check details renew reload dossier activate apply-license export history help quit exit"
+
+    # Commands that take an IP address argument
+    local ip_commands="check details renew reload dossier activate apply-license remove"
+
+    case "$prev" in
+        check|details|renew|reload|dossier|activate|apply-license|remove)
+            # Complete with device IPs from database
+            if [[ -f "${HOME}/.f5lm/devices.json" ]]; then
+                devices=$(jq -r '.[].ip' "${HOME}/.f5lm/devices.json" 2>/dev/null)
+                if [[ "$prev" == "check" ]]; then
+                    devices="all $devices"
+                fi
+                COMPREPLY=( $(compgen -W "$devices" -- "$cur") )
+            fi
+            return 0
+            ;;
+        f5lm|f5-license.sh|*/f5-license.sh)
+            COMPREPLY=( $(compgen -W "$commands --help --version --verbose --debug --completions" -- "$cur") )
+            return 0
+            ;;
+        --completions)
+            COMPREPLY=( $(compgen -W "bash zsh" -- "$cur") )
+            return 0
+            ;;
+    esac
+
+    # Default to commands
+    if [[ ${#COMP_WORDS[@]} -eq 2 ]]; then
+        COMPREPLY=( $(compgen -W "$commands --help --version --verbose --debug --completions" -- "$cur") )
+    fi
+}
+
+complete -F _f5lm_completions f5lm
+complete -F _f5lm_completions f5-license.sh
+BASH_COMPLETION
+            ;;
+        zsh)
+            cat << 'ZSH_COMPLETION'
+#compdef f5lm f5-license.sh
+# Zsh completion for f5lm (F5 License Manager)
+# Install: f5-license.sh --completions zsh > ~/.zsh/completions/_f5lm
+#          (ensure fpath includes ~/.zsh/completions)
+
+_f5lm_devices() {
+    local devices
+    if [[ -f "${HOME}/.f5lm/devices.json" ]]; then
+        devices=(${(f)"$(jq -r '.[].ip' "${HOME}/.f5lm/devices.json" 2>/dev/null)"})
+        _describe 'device' devices
+    fi
+}
+
+_f5lm() {
+    local -a commands
+    commands=(
+        'add:Add a device to the database'
+        'add-multi:Add multiple devices from file or input'
+        'remove:Remove a device from the database'
+        'list:List all devices and their license status'
+        'check:Check license status for a device or all'
+        'details:Show detailed license information'
+        'renew:Apply a new registration key'
+        'reload:Reload license on device'
+        'dossier:Generate dossier for license activation'
+        'activate:Full license activation wizard'
+        'apply-license:Apply license file to device'
+        'export:Export devices to CSV'
+        'history:Show operation history'
+        'help:Show help information'
+        'quit:Exit interactive mode'
+        'exit:Exit interactive mode'
+    )
+
+    _arguments -C \
+        '--help[Show help]' \
+        '--version[Show version]' \
+        '--verbose[Enable verbose output]' \
+        '--debug[Enable debug mode]' \
+        '--completions[Generate shell completions]:shell:(bash zsh)' \
+        '1:command:->command' \
+        '*:args:->args'
+
+    case "$state" in
+        command)
+            _describe 'command' commands
+            ;;
+        args)
+            case "${words[2]}" in
+                check)
+                    _alternative \
+                        'special:special:(all)' \
+                        'devices:device:_f5lm_devices'
+                    ;;
+                details|renew|reload|dossier|activate|apply-license|remove)
+                    _f5lm_devices
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_f5lm "$@"
+ZSH_COMPLETION
+            ;;
+        *)
+            msg_err "Unknown shell type: $shell_type (use 'bash' or 'zsh')"
+            return 1
+            ;;
+    esac
 }
 
 # Entry point
