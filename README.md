@@ -2,7 +2,7 @@
 
 A powerful, interactive CLI tool for F5 BIG-IP license lifecycle management. Manage licenses across multiple F5 devices from a single terminal interface.
 
-![Version](https://img.shields.io/badge/version-3.8.10-blue.svg)
+![Version](https://img.shields.io/badge/version-3.8.12-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20BSD%20%7C%20WSL-lightgrey.svg)
 ![Bash](https://img.shields.io/badge/bash-3.2%2B-green.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
@@ -15,7 +15,9 @@ A powerful, interactive CLI tool for F5 BIG-IP license lifecycle management. Man
 - **Auto-Check on Add** - Automatically checks license status when adding devices
 - **License Renewal** - Apply new licenses via REST API with automatic verification
 - **Dossier Generation** - Generate dossiers via REST API or SSH fallback
+- **Add-on Key Application** - Apply add-on registration keys to existing licensed devices
 - **One-Step License Application** - Paste or upload license directly from the tool
+- **License Transfer** - Transfer VE licenses between virtual BIG-IP systems
 - **Flexible SSH Auth** - Supports both SSH key and password authentication
 - **Secure** - Credentials never stored, used only for active session
 - **Export** - Export device inventory to CSV
@@ -170,8 +172,10 @@ f5lm > add 192.168.1.100
 | `renew <ip> <key>` | Apply registration key via REST API |
 | `reload <ip>` | Reload license file via SSH |
 | `dossier <ip>` | Generate dossier + optional license apply |
+| `addon <ip> <addon-key> [base-key]` | Apply add-on key to licensed device |
 | `apply-license <ip>` | Apply license file/content to device |
 | `activate <ip>` | Interactive license activation wizard |
+| `transfer <ip> [--to]` | Transfer VE license to new system (VE only) |
 
 **Example - Check All:**
 ```bash
@@ -187,6 +191,28 @@ f5lm > dossier 192.168.1.100
   [OK] Dossier retrieved via SSH
   Saved to: ~/.f5lm/dossier_192_168_1_100.txt
 
+  [P] Paste license content here
+  [F] Upload license from local file
+  [S] Skip - apply license manually later
+```
+
+**Example - Apply Add-on Key:**
+```bash
+f5lm > addon 192.168.1.100 ABCDE-FGHIJ-KLMNO-PQRST
+  [OK] Found base registration key: XXXXX-XXXXX-XXXXX-XXXXX-XXXXXXX
+  [INFO] Generating dossier with base + add-on keys...
+  [OK] Dossier generated via SSH
+
+  DOSSIER (with add-on key)
+  Base Key: XXXXX-XXXXX-XXXXX-XXXXX-XXXXXXX
+  Add-on Key: ABCDE-FGHIJ-KLMNO-PQRST
+
+  ──────────────────────────────────────────────────────
+  [hex dossier content...]
+  ──────────────────────────────────────────────────────
+
+  [O] Online activation (device has internet)
+  [M] Manual activation (via F5 portal)
   [P] Paste license content here
   [F] Upload license from local file
   [S] Skip - apply license manually later
@@ -284,9 +310,93 @@ All data is stored locally in `~/.f5lm/`:
 
 ---
 
+## License Transfer (v3.8.11)
+
+Transfer a BIG-IP VE license from one virtual instance to another. Based on F5 Knowledge Base article K41458656.
+
+**Important:** License transfer only works for BIG-IP **Virtual Edition (VE)** systems, not physical appliances.
+
+### Requirements
+
+- BIG-IP VE version 12.1.3.3+ or 13.1.0.2+
+- Source system must have network access to `activate.f5.com` on TCP port 443
+- Admin credentials for the source device
+
+### Usage
+
+```bash
+# Revoke license from source device (VE only)
+f5lm > transfer 192.168.1.100
+
+# Revoke and immediately activate on new device
+f5lm > transfer 192.168.1.100 --to 192.168.1.200
+```
+
+### What Happens
+
+1. **Verification** - Tool checks that the device is a Virtual Edition (platform Z100, Z101, etc.)
+2. **Warning** - Displays explicit warning about consequences
+3. **Confirmation** - Requires typing "REVOKE" to confirm
+4. **Revocation** - Contacts F5 license server to revoke the license
+5. **Registration Key** - Displays the key for reactivation on another system
+
+### Example
+
+```bash
+f5lm > transfer 10.1.1.1
+
+  LICENSE TRANSFER
+  Transfer license from BIG-IP VE to another system
+
+  >>> Checking if 10.1.1.1 is a Virtual Edition...
+  [OK] Platform verified: Z100 (Virtual Edition)
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║                         ⚠ WARNING ⚠                              ║
+  ╠══════════════════════════════════════════════════════════════════╣
+  ║  Revoking the license will:                                      ║
+  ║  • IMMEDIATELY disable traffic management                        ║
+  ║  • Return the device to an UNLICENSED state                      ║
+  ║  • Stop all BIG-IP services                                      ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+  Type "REVOKE" to confirm: REVOKE
+
+  >>> Revoking license on 10.1.1.1...
+  [OK] License revoked successfully!
+
+  Registration Key: XXXXX-XXXXX-XXXXX-XXXXX-XXXXXXX
+  This key can now be activated on another BIG-IP VE system.
+```
+
+### References
+
+- [K41458656: Reusing a BIG-IP VE license](https://my.f5.com/manage/s/article/K41458656)
+- [How to move a BIG-IP VE license - DevCentral](https://community.f5.com/kb/technicalarticles/how-to-move-a-big-ip-ve-license/342893)
+
+---
+
 ## Version History
 
-### v3.8.10 (Current)
+### v3.8.12 (Current)
+- **Add-on Key Application** - Apply add-on registration keys to existing licensed F5 BIG-IP devices:
+  - New `addon` command for add-on key application
+  - Generates dossier with both base and add-on keys using `get_dossier -b <base> -a <addon>`
+  - Supports both TMOS and bash shell modes automatically
+  - Handles online/offline scenarios with connectivity detection
+  - Provides multiple license application options (online, manual, paste, file)
+  - Automatically retrieves base registration key from device if not provided
+  - Comprehensive error handling and manual fallback instructions
+
+### v3.8.11
+- **License Transfer** - Transfer VE licenses between virtual BIG-IP systems (per K41458656):
+  - New `transfer` command to revoke license from source VE
+  - Optional `--to` flag to immediately activate on target device
+  - Platform detection to ensure only VE systems are used
+  - Requires explicit confirmation (type "REVOKE") for safety
+- **Platform Detection** - Detects Virtual Edition (Z100, Z101, etc.) vs hardware platforms
+
+### v3.8.10
 - **License End Date for expiration tracking** - Per F5 KB articles K7727, K000151595, K9245:
   - **License End Date** = When device stops processing traffic (used for expiration tracking)
   - **Service Check Date** = Upgrade eligibility only (NOT for license expiration)

@@ -19,13 +19,14 @@ see README.md.
 
 2. Command Examples (Extended)
    - Device Management (add, add-multi, remove)
-   - License Operations (check, details, renew, reload, dossier, apply-license)
+   - License Operations (check, details, renew, reload, dossier, addon, apply-license)
    - Activation Wizard
    - Utilities (export, history)
 
 3. Complete Workflows
    - Direct Renewal (device with internet)
    - Manual Activation (air-gapped devices)
+   - Add-on Key Application (v3.8.12+)
    - CI/CD Pipeline Integration
 
 4. Data Storage
@@ -449,6 +450,151 @@ NOTE: Only one password prompt is required. SSH connection multiplexing reuses
 the authenticated connection for backup, upload, and reload operations.
 
 --------------------------------------------------------------------------------
+addon <ip> <addon-key> [base-key] - Apply Add-on Registration Key (v3.8.12+)
+--------------------------------------------------------------------------------
+
+Apply add-on registration keys to existing licensed F5 BIG-IP devices. This
+command generates a dossier containing both the base and add-on keys, then
+provides options for activating the enhanced license.
+
+IMPORTANT: The device must already have a valid base license installed.
+
+Basic Usage (auto-retrieve base key):
+
+    f5lm > addon 192.168.1.100 AMXZF-ANVER-AGIXS-PCTYM-EQRKIV
+
+      ╔══════════════════════════════════════════════════════════════════╗
+      ║  ADD-ON KEY APPLICATION                                         ║
+      ╠══════════════════════════════════════════════════════════════════╣
+      ║  Device: 192.168.1.100                                           ║
+      ║  Add-on Key: AMXZF-ANVER-AGIXS-PCTYM-EQRKIV                      ║
+      ╚══════════════════════════════════════════════════════════════════╝
+
+      >>> Retrieving base registration key from device...
+      [OK] Found base registration key: S0761-56546-44250-62238-6492008...
+
+      STEP 1: GENERATE DOSSIER WITH ADD-ON KEY
+      ----------------------------------------------------------------------
+      >>> Generating dossier with base + add-on keys...
+      [OK] Dossier generated via SSH
+
+      DOSSIER (with add-on key)
+      Base Key: S0761-56546-44250-62238-6492008...
+      Add-on Key: AMXZF-ANVER-AGIXS-PCTYM-EQRKIV
+
+      ------------------------------------------------------------
+      7279a232f70287bb968a7182bfda402d155b486006022a1b14f5620f06
+      6b1ae4f01d62e42c9a072af3dd116bf8a80b5e713e573d64c21d261991
+      52f89272878b85f5c2263802136efb81f2e3602d0ccb285a52c09bc697
+      ...
+      b8de6fe80bee75ef87
+      ------------------------------------------------------------
+
+      Saved to: ~/.f5lm/dossier_addon_192_168_1_100_20260126_111453.txt
+
+      STEP 2: LICENSE ACTIVATION OPTIONS
+      ----------------------------------------------------------------------
+
+      Checking device connectivity to F5 license server...
+      [OK] Device can reach activate.f5.com
+
+      [O] Online activation (device has internet)
+      [M] Manual activation (via F5 portal)
+      [P] Paste license content here
+      [F] Upload license from local file
+      [S] Skip - apply license manually later
+
+      Choice: M
+
+      MANUAL ACTIVATION STEPS
+      1. Copy the dossier from above (or from: ~/.f5lm/dossier_addon_192_168_1_100_20260126_111453.txt)
+      2. Go to: https://activate.f5.com/license/dossier.jsp
+      3. Paste the dossier
+      4. Enter your add-on key when prompted: AMXZF-ANVER-AGIXS-PCTYM-EQRKIV
+      5. Download the license file
+      6. Run: f5lm apply-license 192.168.1.100 to upload it
+
+Advanced Usage (provide base key explicitly):
+
+    f5lm > addon 10.0.0.50 ADDON-12345-67890 BASE-XXXXX-XXXXX-XXXXX-XXXXXXX
+
+      ╔══════════════════════════════════════════════════════════════════╗
+      ║  ADD-ON KEY APPLICATION                                         ║
+      ╠══════════════════════════════════════════════════════════════════╣
+      ║  Device: 10.0.0.50                                               ║
+      ║  Add-on Key: ADDON-12345-67890                                    ║
+      ╚══════════════════════════════════════════════════════════════════╝
+
+      >>> Using provided base key: BASE-XXXXX-XXXXX-XXXXX-XXXXXXX
+
+      STEP 1: GENERATE DOSSIER WITH ADD-ON KEY
+      ----------------------------------------------------------------------
+      >>> Generating dossier with base + add-on keys...
+      [WARN] REST API method may not support add-on keys directly
+      >>> Attempting SSH fallback for dossier generation...
+      [OK] Dossier generated successfully
+      ...
+
+Online Activation Example (device has internet):
+
+      Choice: O
+
+      >>> Attempting online activation...
+      WARNING: This requires the device to have proper DNS and routing to activate.f5.com
+
+      Enter SSH password when prompted:
+
+      >>> Establishing SSH connection...
+      (root@192.168.1.100) Password: ****
+
+      >>> Running: tmsh install sys license registration-key ADDON-12345-67890 add-on-keys { BASE-XXXXX-XXXXX-XXXXX-XXXXXXX }
+      [OK] License with add-on key activated successfully!
+
+      >>> Checking updated license status...
+      192.168.1.100        . 365 days (exp: 2026/01/15)
+
+Offline Mode Example (no internet connectivity):
+
+      Checking device connectivity to F5 license server...
+      [WARN] Device cannot reach activate.f5.com - offline mode required
+
+      ╔═════════════════════════════════════════════════════════════════╗
+      ║  OFFLINE LICENSE ACTIVATION REQUIRED                           ║
+      ╠═════════════════════════════════════════════════════════════════╣
+      ║  The device cannot reach F5 license servers directly.          ║
+      ║  You must use the manual activation process:                   ║
+      ║                                                                 ║
+      ║  1. Copy the dossier above (or from the saved file)           ║
+      ║  2. Go to: https://activate.f5.com/license/dossier.jsp         ║
+      ║  3. Paste the dossier and enter your add-on key               ║
+      ║  4. Download the license file                                  ║
+      ║  5. Choose one of the options below to apply it               ║
+      ╚═════════════════════════════════════════════════════════════════╝
+
+      [P] Paste license content here
+      [F] Upload license from local file
+      [S] Skip - apply license manually later
+
+TMOS/Bash Shell Compatibility:
+The addon command automatically handles different shell modes:
+
+- TMOS Shell: Uses 'bash -c "get_dossier -b <base> -a <addon>"'
+- Bash Shell: Direct execution of 'get_dossier -b <base> -a <addon>'
+- Fallback: Uses full path '/usr/bin/get_dossier' if needed
+
+Common Use Cases:
+1. Adding security modules (ASM, APM, etc.)
+2. Adding performance modules (AFM, DNS, etc.)
+3. Adding additional capacity licenses
+4. Upgrading from base license to enhanced features
+
+Troubleshooting:
+- If dossier generation fails, check manual instructions provided
+- For TMOS shell issues, try: ssh user@device "bash" then run commands manually
+- For offline devices, always use manual activation via F5 portal
+- Base key is automatically retrieved but can be provided explicitly if needed
+
+--------------------------------------------------------------------------------
 apply-license <ip> [license-file] - Apply License File/Content
 --------------------------------------------------------------------------------
 
@@ -584,6 +730,98 @@ Option 2: Manual Activation (air-gapped devices)
       10.0.0.50            . 365 days
 
 --------------------------------------------------------------------------------
+Option 3: Add-on Key Application (v3.8.12+) - Enhance Existing Licensed Device
+--------------------------------------------------------------------------------
+
+Apply add-on registration keys to devices that already have valid base licenses
+installed. This workflow supports both online and offline scenarios.
+
+Scenario A: Online Device (has internet connectivity)
+
+    # 1. Check current license status
+    f5lm > details 192.168.1.100
+
+      | Status:        ACTIVE (152 days)                            |
+      | License End:   2026/06/15                                   |
+      | Platform:      Z100 (Virtual Edition)                       |
+      | Reg Key:       ABCDE-FGHIJ-KLMNO-PQRST-UVWXYZZ              |
+
+    # 2. Apply add-on key
+    f5lm > addon 192.168.1.100 ADDON-12345-67890-PQRST-UVWXY
+
+      [OK] Found base registration key: ABCDE-FGHIJ-KLMNO-PQRST-UVWXYZZ...
+      [OK] Dossier generated via SSH
+      [OK] Device can reach activate.f5.com
+
+      [O] Online activation (device has internet)
+      [M] Manual activation (via F5 portal)
+      [P] Paste license content here
+      [F] Upload license from local file
+      [S] Skip - apply license manually later
+
+      Choice: O
+
+      [OK] License with add-on key activated successfully!
+      192.168.1.100        . 365 days (exp: 2026/01/15)
+
+Scenario B: Offline Device (no internet connectivity)
+
+    # 1. Generate dossier with add-on key
+    f5lm > addon 10.1.1.50 ADDON-98765-43210-ZYXWV-UTSRQ
+
+      [OK] Found base registration key: BASE-11111-22222-33333-44444...
+      [OK] Dossier generated successfully
+      [WARN] Device cannot reach activate.f5.com - offline mode required
+
+      ╔═════════════════════════════════════════════════════════════════╗
+      ║  OFFLINE LICENSE ACTIVATION REQUIRED                           ║
+      ║  1. Copy the dossier above (or from the saved file)           ║
+      ║  2. Go to: https://activate.f5.com/license/dossier.jsp         ║
+      ║  3. Paste the dossier and enter your add-on key               ║
+      ║  4. Download the license file                                  ║
+      ╚═════════════════════════════════════════════════════════════════╝
+
+      Choice: S  # Skip for now, will apply manually
+
+    # 2. External step: Go to F5 portal manually
+    #    - Visit: https://activate.f5.com/license/dossier.jsp
+    #    - Paste the dossier from ~/.f5lm/dossier_addon_10_1_1_50_*.txt
+    #    - Enter add-on key: ADDON-98765-43210-ZYXWV-UTSRQ
+    #    - Download enhanced license file
+
+    # 3. Apply the enhanced license
+    f5lm > apply-license 10.1.1.50 ~/Downloads/enhanced_license.txt
+
+      [OK] License content loaded (247 lines)
+      [OK] License written to device
+      [OK] License reload initiated
+      [OK] Device is back online
+
+      10.1.1.50            . 365 days (exp: 2026/01/15)
+
+Scenario C: Multiple Add-on Keys (batch workflow)
+
+    # Apply multiple add-on keys to different devices
+    # Note: Each device must already have a valid base license
+
+    f5lm > addon 10.0.0.10 ASM-SECURITY-KEY-12345
+    f5lm > addon 10.0.0.11 APM-ACCESS-KEY-67890
+    f5lm > addon 10.0.0.12 AFM-FIREWALL-KEY-54321
+
+    # Check all enhanced licenses
+    f5lm > check all
+
+      10.0.0.10            . 365 days (exp: 2026/01/15) [ASM Enhanced]
+      10.0.0.11            . 365 days (exp: 2026/01/15) [APM Enhanced]
+      10.0.0.12            . 365 days (exp: 2026/01/15) [AFM Enhanced]
+
+Common Add-on Use Cases:
+- Security modules: ASM (Application Security), APM (Access Policy Manager)
+- Performance modules: AFM (Application Firewall), DNS services
+- Capacity increases: Additional throughput, connections, or features
+- Platform upgrades: From Good/Better to Best licensing tiers
+
+--------------------------------------------------------------------------------
 CI/CD Pipeline Integration
 --------------------------------------------------------------------------------
 
@@ -608,7 +846,8 @@ All data is stored locally in ~/.f5lm/ (or $XDG_DATA_HOME/f5lm/):
     devices.json        Device inventory
     history.log         Action history
     .cmd_history        Command history (readline)
-    dossier_*.txt       Generated dossiers
+    dossier_*.txt       Generated dossiers (base licenses)
+    dossier_addon_*.txt Generated dossiers with add-on keys (v3.8.12+)
     export_*.csv        Exported data
 
 NOTE: Credentials are NEVER stored.

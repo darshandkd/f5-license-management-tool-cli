@@ -4,7 +4,7 @@
 #   F5 LICENSE MANAGER (f5lm)
 #   Interactive CLI for F5 BIG-IP License Lifecycle Management
 #
-#   Version:       3.8.10
+#   Version:       3.8.12
 #   Compatibility: Linux, macOS, FreeBSD, WSL, Cygwin
 #   Requirements:  bash 3.2+, curl, jq
 #   Optional:      sshpass (for SSH password automation)
@@ -22,7 +22,7 @@
 set -o pipefail 2>/dev/null || true
 
 # Script metadata
-readonly F5LM_VERSION="3.8.10"
+readonly F5LM_VERSION="3.8.12"
 readonly F5LM_NAME="F5 License Manager"
 
 # Exit codes
@@ -1206,10 +1206,10 @@ f5_install_license() {
     local token="$2"
     local regkey="$3"
     local timeout_sec="${4:-60}"
-    
+
     local regkey_escaped
     regkey_escaped=$(json_escape "$regkey")
-    
+
     run_with_timeout "$timeout_sec" \
         curl -sk -X POST "https://${ip}/mgmt/tm/sys/license" \
         -H "Content-Type: application/json" \
@@ -1217,9 +1217,49 @@ f5_install_license() {
         -d "{\"command\":\"install\",\"registrationKey\":\"${regkey_escaped}\"}" 2>/dev/null
 }
 
+# Revoke license via REST API (for BIG-IP VE only)
+# Per K41458656: This disables traffic management and returns system to unlicensed state
+f5_revoke_license() {
+    local ip="$1"
+    local token="$2"
+    local timeout_sec="${3:-60}"
+
+    debug_curl "https://${ip}/mgmt/tm/sys/license" "POST (revoke)"
+    verbose_msg "Revoking license on $ip"
+
+    run_with_timeout "$timeout_sec" \
+        curl -sk -X POST "https://${ip}/mgmt/tm/sys/license" \
+        -H "Content-Type: application/json" \
+        -H "X-F5-Auth-Token: $token" \
+        -d '{"command":"revoke"}' 2>/dev/null
+}
+
+# Get platform info via REST API
+f5_get_platform() {
+    local ip="$1"
+    local token="$2"
+    local timeout_sec="${3:-$F5LM_REST_TIMEOUT}"
+
+    debug_curl "https://${ip}/mgmt/tm/sys/hardware" "GET"
+
+    run_with_timeout "$timeout_sec" \
+        curl -sk "https://${ip}/mgmt/tm/sys/hardware" \
+        -H "X-F5-Auth-Token: $token" 2>/dev/null
+}
+
 # Parse license JSON response
+# Returns: regkey|license_end_date|service_check_date
+# Special case: returns "UNLICENSED||" for unlicensed/inoperative devices
 parse_license_info() {
     local json="$1"
+
+    # Check for unlicensed/inoperative device via REST API
+    # Response contains: {"apiRawValues": {"apiAnonymous": "Can't load license..."}}
+    if printf '%s' "$json" | grep -qi "Can't load license\|may not be operational\|no license"; then
+        echo "UNLICENSED||"
+        return 0
+    fi
+
     # Return format: regkey|license_end_date|service_check_date
     # Use License End Date for expiration tracking (per K7727, K000151595)
     # License End Date is when the license actually expires (subscription/eval/trial)
@@ -1626,8 +1666,10 @@ cmd_help() {
     printf '    %brenew%b <ip> <key>      Apply registration key\n' "$BD" "$RS"
     printf '    %breload%b <ip>           Reload license (SSH)\n' "$BD" "$RS"
     printf '    %bdossier%b <ip> [key]    Generate dossier + apply license\n' "$BD" "$RS"
+    printf '    %baddon%b <ip> <addon-key> Apply add-on key to licensed device\n' "$BD" "$RS"
     printf '    %bapply-license%b <ip>    Apply license file/content\n' "$BD" "$RS"
     printf '    %bactivate%b <ip>         Activation wizard\n' "$BD" "$RS"
+    printf '    %btransfer%b <ip> [--to]  Transfer VE license to new system\n' "$BD" "$RS"
     printf '\n'
     printf '  %bUtilities%b\n' "$C" "$RS"
     printf '    %bexport%b                Export to CSV\n' "$BD" "$RS"
@@ -1680,24 +1722,33 @@ cmd_help() {
 # Uses direct SSH commands - handles both TMOS and bash shell prompts
 # For TMOS: tmsh commands work directly
 # For Bash: tmsh commands also work directly
+# Returns: regkey|license_end_date|service_check_date
+# Special case: returns "UNLICENSED||" for unlicensed/inoperative devices
 _get_license_via_ssh() {
     local ip="$1"
-    
+
     # Try tmsh command first (works from both TMOS and bash)
     local lic_output
     lic_output=$(_f5_ssh_cmd "$ip" "tmsh show sys license" 15)
     local rc=$?
-    
+
     # Check if SSH succeeded
     if [[ $rc -ne 0 ]]; then
         return 1
     fi
-    
+
     # If tmsh failed (might be in bash without tmsh in path), try with full path
     if [[ -z "$lic_output" ]] || echo "$lic_output" | grep -qi "command not found\|not found"; then
         lic_output=$(_f5_ssh_cmd "$ip" "/usr/bin/tmsh show sys license" 15)
     fi
-    
+
+    # Check for unlicensed/inoperative device
+    # When license is revoked or missing, F5 returns: "Can't load license, may not be operational"
+    if echo "$lic_output" | grep -qi "Can't load license\|may not be operational\|no license"; then
+        echo "UNLICENSED||"
+        return 0
+    fi
+
     # Parse registration key
     local regkey=""
     regkey=$(echo "$lic_output" | grep -i "Registration Key" | awk '{print $NF}' | head -1)
@@ -1724,6 +1775,79 @@ _get_license_via_ssh() {
 
     # Return in format: regkey|license_end_date|service_check_date
     echo "${regkey}|${license_end}|${service_check}"
+}
+
+# Revoke license via SSH (for BIG-IP VE only)
+# Per K41458656: This disables traffic management and returns system to unlicensed state
+_revoke_license_via_ssh() {
+    local ip="$1"
+    local timeout_sec="${2:-30}"
+
+    debug_ssh "revoke sys license" "$ip"
+    verbose_msg "Revoking license on $ip via SSH"
+
+    # Try tmsh revoke command first (works from both TMOS and bash)
+    local result
+    result=$(_f5_ssh_cmd "$ip" "tmsh revoke sys license" "$timeout_sec")
+    local rc=$?
+
+    # Check if SSH succeeded
+    if [[ $rc -ne 0 ]]; then
+        # Try with full path
+        result=$(_f5_ssh_cmd "$ip" "/usr/bin/tmsh revoke sys license" "$timeout_sec")
+        rc=$?
+    fi
+
+    # Try alternative: just "revoke sys license" (if in TMOS shell)
+    if [[ $rc -ne 0 ]] || echo "$result" | grep -qi "command not found\|not found\|syntax"; then
+        result=$(_f5_ssh_cmd "$ip" "revoke sys license" "$timeout_sec")
+        rc=$?
+    fi
+
+    debug_log "Revoke result (rc=$rc): ${result:0:200}"
+    echo "$result"
+    return $rc
+}
+
+# Get platform information via SSH
+# Returns platform ID (e.g., Z100 for VE, i5600 for hardware)
+_get_platform_via_ssh() {
+    local ip="$1"
+
+    debug_ssh "tmsh show sys hardware" "$ip"
+
+    local hw_output
+    hw_output=$(_f5_ssh_cmd "$ip" "tmsh show sys hardware | grep -i 'platform'" 15)
+    local rc=$?
+
+    if [[ $rc -ne 0 ]] || [[ -z "$hw_output" ]]; then
+        # Try alternative: read from license file
+        hw_output=$(_f5_ssh_cmd "$ip" "grep -i 'Platform' /config/bigip.license" 10)
+    fi
+
+    # Extract platform ID (e.g., Z100, Z101, i5600, i10800)
+    local platform
+    platform=$(echo "$hw_output" | grep -i "platform" | head -1 | awk '{print $NF}' | tr -d '[:space:]')
+
+    echo "$platform"
+}
+
+# Check if device is a Virtual Edition (VE)
+# VE platforms typically have platform IDs starting with Z (Z100, Z101, etc.)
+# Per K41458656: License transfer only works for BIG-IP VE systems
+_check_platform_is_ve() {
+    local platform="$1"
+
+    # VE platform IDs: Z100, Z101, Z105 (different VE models/throughput tiers)
+    # Hardware platform IDs: i5600, i5800, i7600, i7800, i10600, i10800, etc.
+    case "$platform" in
+        Z[0-9]*|z[0-9]*)
+            return 0  # Is VE
+            ;;
+        *)
+            return 1  # Not VE (hardware or unknown)
+            ;;
+    esac
 }
 
 # Internal function to check a single device (no credential prompt)
@@ -2459,6 +2583,17 @@ cmd_check() {
         F5_PASS="$saved_pass"
         F5_SSH_KEY="$saved_key"
 
+        # Check for unlicensed/inoperative device
+        # When license is revoked, regkey will be "UNLICENSED" (set by parse_license_info/_get_license_via_ssh)
+        if [[ "$regkey" == "UNLICENSED" ]]; then
+            printf '%b%s unlicensed%b %b(no license installed)%b\n' \
+                "$R" "$SYM_ERR" "$RS" "$D" "$RS"
+            db_update "$ip" "" "" "unlicensed" "" ""
+            log_event "CHECKED $ip: unlicensed (no license)"
+            ok=$((ok + 1))
+            continue
+        fi
+
         # If no regkey found, license data isn't ready
         # But empty expires is valid (perpetual license)
         if [[ -z "$regkey" ]]; then
@@ -2650,22 +2785,32 @@ cmd_details() {
         # Use SSH to get license details
         local lic_output
         lic_output=$(_get_license_details_via_ssh "$ip")
-        
+
         if [[ -z "$lic_output" ]]; then
             msg_err_hint "SSH connection failed to $ip" "ssh_connect"
             return 1
         fi
-        
-        # Parse tmsh output
-        regkey=$(echo "$lic_output" | grep -i "Registration Key" | awk '{print $NF}' | head -1)
-        expires=$(echo "$lic_output" | grep -i "License End Date" | awk '{print $NF}' | head -1)
-        service=$(echo "$lic_output" | grep -i "Service Check Date" | awk '{print $NF}' | head -1)
-        licensed=$(echo "$lic_output" | grep -i "Licensed On" | awk '{print $NF}' | head -1)
-        platform=$(echo "$lic_output" | grep -i "Platform ID" | awk '{print $NF}' | head -1)
-        
-        if [[ -z "$regkey" && -z "$expires" ]]; then
-            msg_err_hint "Could not parse license from SSH output" "license_parse"
-            return 1
+
+        # Check for unlicensed/inoperative device
+        if echo "$lic_output" | grep -qi "Can't load license\|may not be operational\|no license"; then
+            regkey="UNLICENSED"
+            expires=""
+            service=""
+            licensed=""
+            # Try to get platform info even on unlicensed device
+            platform=$(_get_platform_via_ssh "$ip" 2>/dev/null)
+        else
+            # Parse tmsh output
+            regkey=$(echo "$lic_output" | grep -i "Registration Key" | awk '{print $NF}' | head -1)
+            expires=$(echo "$lic_output" | grep -i "License End Date" | awk '{print $NF}' | head -1)
+            service=$(echo "$lic_output" | grep -i "Service Check Date" | awk '{print $NF}' | head -1)
+            licensed=$(echo "$lic_output" | grep -i "Licensed On" | awk '{print $NF}' | head -1)
+            platform=$(echo "$lic_output" | grep -i "Platform ID" | awk '{print $NF}' | head -1)
+
+            if [[ -z "$regkey" && -z "$expires" ]]; then
+                msg_err_hint "Could not parse license from SSH output" "license_parse"
+                return 1
+            fi
         fi
     else
         # Use REST API
@@ -2680,37 +2825,56 @@ cmd_details() {
 
         local lic_json
         lic_json=$(f5_get_license "$ip" "$token")
-        
-        # Parse all fields
-        local info
-        info=$(printf '%s' "$lic_json" | jq -r '
-            .entries | to_entries[] | select(.key | contains("/license/")) |
-            .value.nestedStats.entries |
-            "regkey:\(.registrationKey.description // "N/A")\nexpires:\(.licenseEndDate.description // "N/A")\nservice:\(.serviceCheckDate.description // "N/A")\nlicensed:\(.licensedOnDate.description // "N/A")\nplatform:\(.platformId.description // "N/A")"
-        ' 2>/dev/null | head -5)
-        
-        if [[ -z "$info" ]]; then
-            msg_err "Could not parse license"
-            return 1
+
+        # Check for unlicensed/inoperative device
+        # Response contains: {"apiRawValues": {"apiAnonymous": "Can't load license..."}}
+        if printf '%s' "$lic_json" | grep -qi "Can't load license\|may not be operational\|no license"; then
+            regkey="UNLICENSED"
+            expires=""
+            service=""
+            licensed=""
+            # Try to get platform info even on unlicensed device
+            local hw_json
+            hw_json=$(f5_get_platform "$ip" "$token" 2>/dev/null)
+            platform=$(printf '%s' "$hw_json" | jq -r '.entries[].nestedStats.entries.platformId.description // empty' 2>/dev/null | head -1)
+        else
+            # Parse all fields
+            local info
+            info=$(printf '%s' "$lic_json" | jq -r '
+                .entries | to_entries[] | select(.key | contains("/license/")) |
+                .value.nestedStats.entries |
+                "regkey:\(.registrationKey.description // "N/A")\nexpires:\(.licenseEndDate.description // "N/A")\nservice:\(.serviceCheckDate.description // "N/A")\nlicensed:\(.licensedOnDate.description // "N/A")\nplatform:\(.platformId.description // "N/A")"
+            ' 2>/dev/null | head -5)
+
+            if [[ -z "$info" ]]; then
+                msg_err "Could not parse license"
+                return 1
+            fi
+
+            # Extract fields (portable grep)
+            regkey=$(printf '%s' "$info" | grep '^regkey:' | cut -d: -f2-)
+            expires=$(printf '%s' "$info" | grep '^expires:' | cut -d: -f2-)
+            service=$(printf '%s' "$info" | grep '^service:' | cut -d: -f2-)
+            licensed=$(printf '%s' "$info" | grep '^licensed:' | cut -d: -f2-)
+            platform=$(printf '%s' "$info" | grep '^platform:' | cut -d: -f2-)
         fi
-        
-        # Extract fields (portable grep)
-        regkey=$(printf '%s' "$info" | grep '^regkey:' | cut -d: -f2-)
-        expires=$(printf '%s' "$info" | grep '^expires:' | cut -d: -f2-)
-        service=$(printf '%s' "$info" | grep '^service:' | cut -d: -f2-)
-        licensed=$(printf '%s' "$info" | grep '^licensed:' | cut -d: -f2-)
-        platform=$(printf '%s' "$info" | grep '^platform:' | cut -d: -f2-)
     fi
 
-    # Use License End Date for expiration tracking (per K7727, K000151595)
-    # License End Date is when the license actually expires (subscription/eval/trial)
-    # Empty/null/N/A means perpetual license (device runs forever)
-    # Note: Service Check Date is only for upgrade eligibility, NOT license expiration
+    # Handle unlicensed/inoperative device
     local days status
-    days=$(calc_days_until "$expires")
-    status=$(get_status_from_days "$days")
-
-    db_update "$ip" "$expires" "$days" "$status" "$regkey" "$service"
+    if [[ "$regkey" == "UNLICENSED" ]]; then
+        days="?"
+        status="unlicensed"
+        db_update "$ip" "" "" "unlicensed" "" ""
+    else
+        # Use License End Date for expiration tracking (per K7727, K000151595)
+        # License End Date is when the license actually expires (subscription/eval/trial)
+        # Empty/null/N/A means perpetual license (device runs forever)
+        # Note: Service Check Date is only for upgrade eligibility, NOT license expiration
+        days=$(calc_days_until "$expires")
+        status=$(get_status_from_days "$days")
+        db_update "$ip" "$expires" "$days" "$status" "$regkey" "$service"
+    fi
 
     # JSON output mode
     if [[ "$JSON_OUTPUT" -eq 1 ]]; then
@@ -2753,6 +2917,10 @@ cmd_details() {
         expired)
             status_display="${R}EXPIRED${RS}"
             days_display="$days days"
+            ;;
+        unlicensed)
+            status_display="${R}UNLICENSED${RS}"
+            days_display="no license installed"
             ;;
         *)
             status_display="${D}UNKNOWN${RS}"
@@ -3799,6 +3967,625 @@ cmd_activate() {
 }
 
 #-------------------------------------------------------------------------------
+# COMMANDS: TRANSFER (BIG-IP VE license transfer)
+# Per K41458656: Reusing a BIG-IP VE license on a different BIG-IP VE system
+#-------------------------------------------------------------------------------
+cmd_transfer() {
+    local source_ip="$1"
+    local target_ip=""
+
+    # Parse arguments
+    shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --to|-t)
+                target_ip="$2"
+                shift 2
+                ;;
+            *)
+                if [[ -z "$target_ip" ]]; then
+                    target_ip="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$source_ip" ]]; then
+        msg_err "Usage: transfer <source-ip> [--to <target-ip>]"
+        printf '      %bRevoke license from source and optionally reactivate on target%b\n' "$D" "$RS"
+        return 1
+    fi
+
+    printf '\n'
+    printf '  %bLICENSE TRANSFER%b\n' "$BD" "$RS"
+    printf '  %bTransfer license from BIG-IP VE to another system%b\n' "$D" "$RS"
+    printf '\n'
+
+    # Step 1: Get credentials and verify platform
+    prompt_credentials "$source_ip" || return 1
+
+    printf '\n'
+    msg_info "Checking if $source_ip is a Virtual Edition..."
+
+    local db_auth_type platform
+    db_auth_type=$(db_get_auth_type "$source_ip")
+
+    if [[ "$db_auth_type" == "key" && -n "$F5_SSH_KEY" && -z "$F5_PASS" ]]; then
+        # Get platform via SSH
+        platform=$(_get_platform_via_ssh "$source_ip")
+    else
+        # Get platform via REST API
+        local auth_resp token
+        auth_resp=$(f5_auth "$source_ip" 10)
+        token=$(printf '%s' "$auth_resp" | jq -r '.token.token // empty' 2>/dev/null)
+
+        if [[ -z "$token" ]]; then
+            msg_err_hint "Cannot authenticate to $source_ip" "rest_auth"
+            return 1
+        fi
+
+        local hw_json
+        hw_json=$(f5_get_platform "$source_ip" "$token")
+        platform=$(printf '%s' "$hw_json" | jq -r '.entries | to_entries[] | select(.key | contains("platformId")) | .value.nestedStats.entries.platformId.description // empty' 2>/dev/null | head -1)
+
+        # Fallback: try to get from license
+        if [[ -z "$platform" ]]; then
+            local lic_json
+            lic_json=$(f5_get_license "$source_ip" "$token" 10)
+            platform=$(printf '%s' "$lic_json" | jq -r '.entries | to_entries[] | .value.nestedStats.entries.platformId.description // empty' 2>/dev/null | head -1)
+        fi
+    fi
+
+    # Check if platform was detected
+    if [[ -z "$platform" ]]; then
+        msg_warn "Could not detect platform. Assuming Virtual Edition."
+        printf '  %bContinue anyway? [y/N]: %b' "$D" "$RS"
+        local cont
+        read -r cont
+        if [[ ! "$cont" =~ ^[Yy]$ ]]; then
+            printf '  Cancelled\n'
+            return 0
+        fi
+    elif ! _check_platform_is_ve "$platform"; then
+        msg_err "License transfer only works for BIG-IP Virtual Edition (VE)"
+        printf '  %bDetected platform: %s%b\n' "$D" "$platform" "$RS"
+        printf '  %bPhysical appliances do not support license revocation.%b\n' "$D" "$RS"
+        printf '  %bContact F5 Support for hardware license issues.%b\n' "$D" "$RS"
+        return 1
+    else
+        msg_ok "Platform verified: $platform (Virtual Edition)"
+    fi
+
+    # Get current license info for display
+    printf '\n'
+    msg_info "Getting current license information..."
+
+    local regkey=""
+    if [[ "$db_auth_type" == "key" && -n "$F5_SSH_KEY" && -z "$F5_PASS" ]]; then
+        local ssh_result
+        ssh_result=$(_get_license_via_ssh "$source_ip")
+        regkey=$(echo "$ssh_result" | cut -d'|' -f1)
+    else
+        local lic_json parsed
+        lic_json=$(f5_get_license "$source_ip" "$token" 10)
+        parsed=$(parse_license_info "$lic_json")
+        regkey=$(echo "$parsed" | cut -d'|' -f1)
+    fi
+
+    if [[ -z "$regkey" || "$regkey" == "UNLICENSED" ]]; then
+        msg_warn "No license found on $source_ip"
+        printf '  %bDevice is already in UNLICENSED/INOPERATIVE state.%b\n' "$D" "$RS"
+        printf '  %bNo license to transfer.%b\n' "$D" "$RS"
+        return 0
+    fi
+
+    printf '  %bRegistration Key: %s%b\n' "$D" "$regkey" "$RS"
+
+    # Step 2: Show warning and get confirmation
+    printf '\n'
+    printf '  %b╔══════════════════════════════════════════════════════════════════╗%b\n' "$Y" "$RS"
+    printf '  %b║                         ⚠ WARNING ⚠                              ║%b\n' "$Y" "$RS"
+    printf '  %b╠══════════════════════════════════════════════════════════════════╣%b\n' "$Y" "$RS"
+    printf '  %b║  Revoking the license will:                                      ║%b\n' "$Y" "$RS"
+    printf '  %b║                                                                  ║%b\n' "$Y" "$RS"
+    printf '  %b║  • IMMEDIATELY disable traffic management on %s%b\n' "$Y" "$source_ip" "$RS"
+    printf '  %b║  • Return the device to an UNLICENSED state                      ║%b\n' "$Y" "$RS"
+    printf '  %b║  • Stop all BIG-IP services (no failover protection)             ║%b\n' "$Y" "$RS"
+    printf '  %b║                                                                  ║%b\n' "$Y" "$RS"
+    printf '  %b║  This action requires network connectivity to activate.f5.com   ║%b\n' "$Y" "$RS"
+    printf '  %b║                                                                  ║%b\n' "$Y" "$RS"
+    printf '  %b║  The registration key can be reactivated on another VE system.  ║%b\n' "$Y" "$RS"
+    printf '  %b╚══════════════════════════════════════════════════════════════════╝%b\n' "$Y" "$RS"
+    printf '\n'
+
+    printf '  %bType "REVOKE" to confirm license revocation: %b' "$BD" "$RS"
+    local confirm
+    read -r confirm
+
+    if [[ "$confirm" != "REVOKE" ]]; then
+        printf '  Cancelled (confirmation text did not match)\n'
+        return 0
+    fi
+
+    # Step 3: Revoke the license
+    printf '\n'
+    msg_info "Revoking license on $source_ip..."
+
+    local result rc
+    if [[ "$db_auth_type" == "key" && -n "$F5_SSH_KEY" && -z "$F5_PASS" ]]; then
+        # Revoke via SSH
+        result=$(_revoke_license_via_ssh "$source_ip" 60)
+        rc=$?
+    else
+        # Revoke via REST API
+        result=$(f5_revoke_license "$source_ip" "$token" 60)
+        rc=$?
+
+        # Check for errors in response
+        if printf '%s' "$result" | jq -e '.code' >/dev/null 2>&1; then
+            local errmsg
+            errmsg=$(printf '%s' "$result" | jq -r '.message // "Unknown error"')
+            msg_err "Failed to revoke license: $errmsg"
+            return 1
+        fi
+    fi
+
+    # Check if revocation succeeded
+    if [[ $rc -ne 0 ]]; then
+        msg_err "License revocation failed"
+        [[ -n "$result" ]] && printf '  %b%s%b\n' "$D" "${result:0:200}" "$RS"
+        printf '\n'
+        printf '  %bTroubleshooting:%b\n' "$D" "$RS"
+        printf '    • Ensure device can reach activate.f5.com on TCP 443\n'
+        printf '    • Verify you have admin privileges\n'
+        printf '    • Check if license is already revoked\n'
+        return 1
+    fi
+
+    msg_ok "License revoked successfully!"
+    log_event "TRANSFER_REVOKED $source_ip regkey:${regkey:0:10}..."
+
+    # Update database
+    db_update "$source_ip" "" "" "unlicensed" "" ""
+
+    printf '\n'
+    printf '  %bRegistration Key: %s%b\n' "$G" "$regkey" "$RS"
+    printf '  %bThis key can now be activated on another BIG-IP VE system.%b\n' "$D" "$RS"
+    printf '\n'
+
+    # Step 4: Optionally activate on target
+    if [[ -n "$target_ip" ]]; then
+        printf '\n'
+        printf '  %bActivating license on target: %s%b\n' "$C" "$target_ip" "$RS"
+        printf '\n'
+
+        # Add target to database if not exists
+        db_exists "$target_ip" || db_add "$target_ip"
+
+        # Use the renew command to activate on target
+        cmd_renew "$target_ip" "$regkey"
+    else
+        printf '  %bTo activate on a new system:%b\n' "$D" "$RS"
+        printf '    %bf5lm renew <new-device-ip> %s%b\n' "$BD" "$regkey" "$RS"
+        printf '\n'
+        printf '  %bOr use the F5 License Portal:%b\n' "$D" "$RS"
+        printf '    %bhttps://activate.f5.com/license/dossier.jsp%b\n' "$BD" "$RS"
+    fi
+
+    printf '\n'
+    printf '  %b╔══════════════════════════════════════════════════════════════════╗%b\n' "$G" "$RS"
+    printf '  %b║  License transfer initiated successfully!                        ║%b\n' "$G" "$RS"
+    printf '  %b╚══════════════════════════════════════════════════════════════════╝%b\n' "$G" "$RS"
+    printf '\n'
+}
+
+#-------------------------------------------------------------------------------
+# COMMANDS: ADD-ON KEY
+# Apply add-on registration key to an existing licensed F5 BIG-IP device
+# Generates dossier with base + add-on keys and applies the license
+#-------------------------------------------------------------------------------
+cmd_addon() {
+    local ip="$1"
+    local addon_key="$2"
+    local base_key="${3:-}"
+
+    if [[ -z "$ip" || -z "$addon_key" ]]; then
+        msg_err "Usage: addon <ip> <addon-key> [base-key]"
+        printf '\n'
+        printf '  %bExamples:%b\n' "$D" "$RS"
+        printf '    %baddon 10.0.0.1 ABCDE-FGHIJ-KLMNO-PQRST%b\n' "$BD" "$RS"
+        printf '    %baddon 10.0.0.1 ABCDE-FGHIJ-KLMNO-PQRST XXXXX-XXXXX-XXXXX-XXXXX-XXXXXXX%b\n' "$BD" "$RS"
+        printf '\n'
+        printf '  %bNote:%b If base key is not provided, it will be retrieved from the device.\n' "$D" "$RS"
+        return 1
+    fi
+
+    # Ensure device exists in database
+    db_exists "$ip" || db_add "$ip"
+
+    printf '\n'
+    printf '  %b╔══════════════════════════════════════════════════════════════════╗%b\n' "$C" "$RS"
+    printf '  %b║  ADD-ON KEY APPLICATION                                         ║%b\n' "$C" "$RS"
+    printf '  %b╠══════════════════════════════════════════════════════════════════╣%b\n' "$C" "$RS"
+    printf '  %b║  Device: %-55s ║%b\n' "$C" "$ip" "$RS"
+    printf '  %b║  Add-on Key: %-51s ║%b\n' "$C" "${addon_key:0:51}" "$RS"
+    printf '  %b╚══════════════════════════════════════════════════════════════════╝%b\n' "$C" "$RS"
+    printf '\n'
+
+    prompt_credentials "$ip" || return 1
+
+    # Step 1: Get base registration key if not provided
+    if [[ -z "$base_key" ]]; then
+        msg_info "Retrieving base registration key from device..."
+
+        # Check auth type
+        local db_auth_type
+        db_auth_type=$(db_get_auth_type "$ip")
+
+        if [[ "$db_auth_type" == "key" && -n "$F5_SSH_KEY" && -z "$F5_PASS" ]]; then
+            # Use SSH for key auth
+            local lic_output
+            lic_output=$(_f5_ssh_cmd "$ip" "tmsh show sys license" 15)
+            base_key=$(echo "$lic_output" | grep -i "Registration Key" | awk '{print $NF}' | head -1)
+        else
+            # Use REST API
+            local auth_resp token
+            auth_resp=$(f5_auth "$ip")
+            token=$(printf '%s' "$auth_resp" | jq -r '.token.token // empty' 2>/dev/null)
+
+            if [[ -n "$token" ]]; then
+                local lic_json
+                lic_json=$(f5_get_license "$ip" "$token")
+                base_key=$(echo "$lic_json" | jq -r '
+                    .entries | to_entries[] | select(.key | contains("/license/")) |
+                    .value.nestedStats.entries.registrationKey.description // empty
+                ' 2>/dev/null | head -1)
+            fi
+        fi
+
+        if [[ -z "$base_key" || "$base_key" == "null" ]]; then
+            msg_warn "Could not retrieve base registration key from device"
+            printf '\n'
+            printf '  %bPlease provide the base registration key:%b\n' "$D" "$RS"
+            printf '  Base Registration Key: '
+            read -r base_key
+            if [[ -z "$base_key" ]]; then
+                msg_err "Base registration key required for add-on key application"
+                return 1
+            fi
+        else
+            msg_ok "Found base registration key: ${BD}${base_key:0:35}...${RS}"
+        fi
+    fi
+
+    # Step 2: Generate dossier with both base and add-on keys
+    printf '\n'
+    printf '  %bSTEP 1: GENERATE DOSSIER WITH ADD-ON KEY%b\n' "$BD" "$RS"
+    draw_line 70
+
+    msg_info "Generating dossier with base + add-on keys..."
+
+    local dossier=""
+    local dossier_cmd="get_dossier -b $base_key -a $addon_key"
+
+    # Check auth type for SSH vs REST
+    local db_auth_type
+    db_auth_type=$(db_get_auth_type "$ip")
+
+    if [[ "$db_auth_type" == "key" && -n "$F5_SSH_KEY" && -z "$F5_PASS" ]]; then
+        # SSH method for key auth
+        debug_log "Using SSH method for dossier generation"
+
+        # Try different command variations for TMOS vs bash shell
+        local dossier_output
+
+        # First try: Direct command (works in bash shell)
+        dossier_output=$(_f5_ssh_cmd "$ip" "$dossier_cmd" 30)
+
+        # If that failed, try via bash explicitly (in case we're in TMOS)
+        if [[ -z "$dossier_output" ]] || echo "$dossier_output" | grep -qi "syntax error\|unknown\|not found"; then
+            debug_log "First attempt failed, trying bash -c method"
+            dossier_output=$(_f5_ssh_cmd "$ip" "bash -c '$dossier_cmd'" 30)
+        fi
+
+        # If still failed, try with full path
+        if [[ -z "$dossier_output" ]] || echo "$dossier_output" | grep -qi "syntax error\|unknown\|not found"; then
+            debug_log "Second attempt failed, trying with full path"
+            dossier_output=$(_f5_ssh_cmd "$ip" "/usr/bin/get_dossier -b $base_key -a $addon_key" 30)
+        fi
+
+        # Extract dossier string (hex characters)
+        if [[ -n "$dossier_output" ]]; then
+            dossier=$(echo "$dossier_output" | grep -oE '[a-f0-9]{20,}' | head -1)
+        fi
+
+        if [[ -z "$dossier" ]]; then
+            msg_err "SSH dossier generation failed"
+            # Provide manual instructions
+            printf '\n'
+            printf '  %bMANUAL DOSSIER GENERATION (with add-on key)%b\n' "$BD" "$RS"
+            printf '  %bSSH to the device and run:%b\n' "$D" "$RS"
+            printf '\n'
+            printf '    %bssh %s@%s%b\n' "$BD" "$F5_USER" "$ip" "$RS"
+            printf '    %bbash%b  %b(if you land in TMOS shell)%b\n' "$BD" "$RS" "$D" "$RS"
+            printf '    %bget_dossier -b %s -a %s%b\n' "$BD" "$base_key" "$addon_key" "$RS"
+            printf '\n'
+            return 1
+        fi
+        msg_ok "Dossier generated via SSH"
+    else
+        # REST API method (may not support add-on keys directly)
+        msg_warn "REST API method may not support add-on keys directly"
+        msg_info "Attempting SSH fallback for dossier generation..."
+
+        # Try SSH even for password auth
+        local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=$F5LM_CONNECT_TIMEOUT"
+        local dossier_output=""
+
+        if ssh_has_sshpass && [[ -n "$F5_PASS" ]]; then
+            # Password auth with sshpass
+            dossier_output=$(sshpass -p "$F5_PASS" ssh $ssh_opts "$F5_USER@$ip" "$dossier_cmd" 2>/dev/null)
+
+            # If failed, try with bash -c
+            if [[ -z "$dossier_output" ]] || echo "$dossier_output" | grep -qi "syntax error\|unknown"; then
+                dossier_output=$(sshpass -p "$F5_PASS" ssh $ssh_opts "$F5_USER@$ip" "bash -c '$dossier_cmd'" 2>/dev/null)
+            fi
+        else
+            # Interactive password prompt
+            msg "  ${D}SSH password authentication (you will be prompted)${RS}"
+            printf '\n'
+            dossier_output=$(ssh $ssh_opts "$F5_USER@$ip" "$dossier_cmd" 2>&1)
+
+            # If failed, try with bash -c
+            if [[ -z "$dossier_output" ]] || echo "$dossier_output" | grep -qi "syntax error\|unknown"; then
+                dossier_output=$(ssh $ssh_opts "$F5_USER@$ip" "bash -c '$dossier_cmd'" 2>&1)
+            fi
+        fi
+
+        # Extract dossier
+        if [[ -n "$dossier_output" ]]; then
+            dossier=$(echo "$dossier_output" | grep -oE '[a-f0-9]{20,}' | head -1)
+        fi
+
+        if [[ -z "$dossier" ]]; then
+            msg_err "Failed to generate dossier with add-on key"
+            printf '\n'
+            printf '  %bMANUAL STEPS REQUIRED%b\n' "$BD" "$RS"
+            printf '  %b1. SSH to device: ssh %s@%s%b\n' "$D" "$F5_USER" "$ip" "$RS"
+            printf '  %b2. Run: get_dossier -b %s -a %s%b\n' "$D" "$base_key" "$addon_key" "$RS"
+            printf '  %b3. Copy the dossier output%b\n' "$D" "$RS"
+            return 1
+        fi
+        msg_ok "Dossier generated successfully"
+    fi
+
+    # Step 3: Display dossier and save to file
+    printf '\n'
+    printf '  %bDOSSIER (with add-on key)%b\n' "$BD" "$RS"
+    printf '  %bBase Key: %s%b\n' "$D" "${base_key:0:35}..." "$RS"
+    printf '  %bAdd-on Key: %s%b\n' "$D" "$addon_key" "$RS"
+    printf '\n'
+    draw_line 60
+    echo "$dossier" | fold -w 58 | sed 's/^/  /'
+    draw_line 60
+    printf '\n'
+
+    # Save dossier to file
+    local dossier_file="${DATA_DIR}/dossier_addon_${ip//./_}_$(date +%Y%m%d_%H%M%S).txt"
+    {
+        echo "# F5 BIG-IP Add-on Key Dossier"
+        echo "# Device: $ip"
+        echo "# Base Key: $base_key"
+        echo "# Add-on Key: $addon_key"
+        echo "# Generated: $(date)"
+        echo ""
+        echo "$dossier"
+    } > "$dossier_file" 2>/dev/null
+    msg "  ${D}Saved to: $dossier_file${RS}"
+    printf '\n'
+
+    log_event "ADDON_DOSSIER $ip (base: ${base_key:0:10}..., addon: $addon_key)"
+
+    # Step 4: Provide options for license application
+    printf '  %bSTEP 2: LICENSE ACTIVATION OPTIONS%b\n' "$BD" "$RS"
+    draw_line 70
+    printf '\n'
+
+    # Check if device has internet connectivity
+    printf '  %bChecking device connectivity to F5 license server...%b\n' "$D" "$RS"
+    local has_internet=0
+
+    if [[ "$db_auth_type" == "key" && -n "$F5_SSH_KEY" && -z "$F5_PASS" ]]; then
+        local ping_result
+        ping_result=$(_f5_ssh_cmd "$ip" "ping -c 1 activate.f5.com 2>/dev/null | grep -q '1 received' && echo 'OK'" 5)
+        [[ "$ping_result" == "OK" ]] && has_internet=1
+    else
+        # Try with password auth
+        if ssh_has_sshpass && [[ -n "$F5_PASS" ]]; then
+            local ping_result
+            ping_result=$(sshpass -p "$F5_PASS" ssh $ssh_opts "$F5_USER@$ip" "ping -c 1 activate.f5.com 2>/dev/null | grep -q '1 received' && echo 'OK'" 2>/dev/null)
+            [[ "$ping_result" == "OK" ]] && has_internet=1
+        fi
+    fi
+
+    if [[ $has_internet -eq 1 ]]; then
+        msg_ok "Device can reach activate.f5.com"
+        printf '\n'
+        printf '  %b[O]%b Online activation (device has internet)%b\n' "$BD" "$C" "$RS"
+        printf '  %b[M]%b Manual activation (via F5 portal)%b\n' "$BD" "$C" "$RS"
+        printf '  %b[P]%b Paste license content here%b\n' "$BD" "$C" "$RS"
+        printf '  %b[F]%b Upload license from local file%b\n' "$BD" "$C" "$RS"
+        printf '  %b[S]%b Skip - apply license manually later%b\n' "$BD" "$C" "$RS"
+    else
+        msg_warn "Device cannot reach activate.f5.com - offline mode required"
+        printf '\n'
+        printf '  %b╔═════════════════════════════════════════════════════════════════╗%b\n' "$Y" "$RS"
+        printf '  %b║  OFFLINE LICENSE ACTIVATION REQUIRED                           ║%b\n' "$Y" "$RS"
+        printf '  %b╠═════════════════════════════════════════════════════════════════╣%b\n' "$Y" "$RS"
+        printf '  %b║  The device cannot reach F5 license servers directly.          ║%b\n' "$Y" "$RS"
+        printf '  %b║  You must use the manual activation process:                   ║%b\n' "$Y" "$RS"
+        printf '  %b║                                                                 ║%b\n' "$Y" "$RS"
+        printf '  %b║  1. Copy the dossier above (or from the saved file)           ║%b\n' "$Y" "$RS"
+        printf '  %b║  2. Go to: %bhttps://activate.f5.com/license/dossier.jsp%b         %b║%b\n' "$Y" "$BD" "$Y" "$Y" "$RS"
+        printf '  %b║  3. Paste the dossier and enter your add-on key               ║%b\n' "$Y" "$RS"
+        printf '  %b║  4. Download the license file                                  ║%b\n' "$Y" "$RS"
+        printf '  %b║  5. Choose one of the options below to apply it               ║%b\n' "$Y" "$RS"
+        printf '  %b╚═════════════════════════════════════════════════════════════════╝%b\n' "$Y" "$RS"
+        printf '\n'
+        printf '  %b[P]%b Paste license content here%b\n' "$BD" "$C" "$RS"
+        printf '  %b[F]%b Upload license from local file%b\n' "$BD" "$C" "$RS"
+        printf '  %b[S]%b Skip - apply license manually later%b\n' "$BD" "$C" "$RS"
+    fi
+
+    printf '\n'
+    printf '  Choice: '
+    local choice
+    read -r choice
+
+    case "$choice" in
+        [Oo])
+            # Online activation (only if device has internet)
+            if [[ $has_internet -eq 1 ]]; then
+                printf '\n'
+                msg_info "Attempting online activation..."
+                msg_warn "Note: This requires the device to have proper DNS and routing to activate.f5.com"
+
+                # Try to activate using tmsh command via SSH
+                local activate_cmd="tmsh install sys license registration-key $addon_key add-on-keys { $base_key }"
+                local result
+
+                if [[ "$db_auth_type" == "key" && -n "$F5_SSH_KEY" && -z "$F5_PASS" ]]; then
+                    result=$(_f5_ssh_cmd "$ip" "$activate_cmd" 60)
+                else
+                    if ssh_has_sshpass && [[ -n "$F5_PASS" ]]; then
+                        result=$(sshpass -p "$F5_PASS" ssh $ssh_opts "$F5_USER@$ip" "$activate_cmd" 2>&1)
+                    else
+                        printf '\n'
+                        msg "  ${D}Enter SSH password when prompted:${RS}"
+                        result=$(ssh $ssh_opts "$F5_USER@$ip" "$activate_cmd" 2>&1)
+                    fi
+                fi
+
+                if echo "$result" | grep -qi "license.*installed\|success"; then
+                    msg_ok "License with add-on key activated successfully!"
+                    log_event "ADDON_ACTIVATED $ip (addon: $addon_key)"
+
+                    # Update device info
+                    cmd_check "$ip" >/dev/null 2>&1
+                else
+                    msg_err "Online activation failed"
+                    printf '  %bError output:%b %s\n' "$D" "$RS" "$result"
+                    printf '\n'
+                    printf '  %bPlease use manual activation via the F5 portal%b\n' "$Y" "$RS"
+                fi
+            else
+                msg_err "Online activation not available - device has no internet connectivity"
+            fi
+            ;;
+
+        [Mm])
+            # Manual activation via portal
+            printf '\n'
+            printf '  %bMANUAL ACTIVATION STEPS%b\n' "$BD" "$RS"
+            printf '  %b1. Copy the dossier from above (or from: %s)%b\n' "$D" "$dossier_file" "$RS"
+            printf '  %b2. Go to: %bhttps://activate.f5.com/license/dossier.jsp%b\n' "$D" "$BD" "$RS"
+            printf '  %b3. Paste the dossier%b\n' "$D" "$RS"
+            printf '  %b4. Enter your add-on key when prompted: %s%b\n' "$D" "$addon_key" "$RS"
+            printf '  %b5. Download the license file%b\n' "$D" "$RS"
+            printf '  %b6. Run: %bf5lm apply-license %s%b to upload it\n' "$D" "$BD" "$ip" "$RS"
+            printf '\n'
+            ;;
+
+        [Pp])
+            # Paste license content
+            printf '\n'
+            printf '  %bPaste the license content below (Ctrl-D when done):%b\n' "$D" "$RS"
+            printf '\n'
+
+            # Read multi-line license content
+            local license_content=""
+            while IFS= read -r line; do
+                license_content="${license_content}${line}"$'\n'
+            done
+
+            if [[ -z "$license_content" ]]; then
+                msg_err "No license content provided"
+                return 1
+            fi
+
+            # Save to temp file and apply
+            local temp_license="/tmp/bigip_addon_license_$$"
+            echo "$license_content" > "$temp_license"
+
+            if _upload_license_file "$ip" "$temp_license"; then
+                msg_ok "Add-on license applied successfully!"
+                log_event "ADDON_LICENSE_APPLIED $ip (addon: $addon_key)"
+                rm -f "$temp_license"
+
+                # Wait for services to restart
+                msg_info "Waiting for services to restart..."
+                verify_with_retry "$ip" 120
+
+                # Update device info
+                cmd_check "$ip" >/dev/null 2>&1
+            else
+                msg_err "Failed to apply add-on license"
+                rm -f "$temp_license"
+                return 1
+            fi
+            ;;
+
+        [Ff])
+            # Upload from file
+            printf '\n'
+            printf '  Enter path to license file: '
+            local license_file
+            read -r license_file
+
+            # Expand ~ and handle paths
+            license_file="${license_file/#\~/$HOME}"
+
+            if [[ ! -f "$license_file" ]]; then
+                msg_err "File not found: $license_file"
+                return 1
+            fi
+
+            if _upload_license_file "$ip" "$license_file"; then
+                msg_ok "Add-on license applied successfully!"
+                log_event "ADDON_LICENSE_APPLIED $ip (addon: $addon_key, file: $license_file)"
+
+                # Wait for services to restart
+                msg_info "Waiting for services to restart..."
+                verify_with_retry "$ip" 120
+
+                # Update device info
+                cmd_check "$ip" >/dev/null 2>&1
+            else
+                msg_err "Failed to apply add-on license"
+                return 1
+            fi
+            ;;
+
+        [Ss]|"")
+            # Skip
+            printf '\n'
+            printf '  %bLicense application skipped%b\n' "$D" "$RS"
+            printf '  %bTo apply the license later:%b\n' "$D" "$RS"
+            printf '    %b1. Get license from: https://activate.f5.com/license/dossier.jsp%b\n' "$D" "$RS"
+            printf '    %b2. Use dossier from: %s%b\n' "$D" "$dossier_file" "$RS"
+            printf '    %b3. Run: f5lm apply-license %s%b\n' "$D" "$ip" "$RS"
+            ;;
+
+        *)
+            msg_warn "Invalid choice"
+            ;;
+    esac
+
+    printf '\n'
+}
+
+#-------------------------------------------------------------------------------
 # COMMANDS: EXPORT
 #-------------------------------------------------------------------------------
 cmd_export() {
@@ -3842,20 +4629,26 @@ cmd_history() {
 #-------------------------------------------------------------------------------
 run_command() {
     local input="$1"
-    local cmd args arg1 arg2
-    
+    local cmd args arg1 arg2 arg3
+
     # Trim whitespace
     input="${input#"${input%%[![:space:]]*}"}"
     input="${input%"${input##*[![:space:]]}"}"
-    
+
     # Parse
     cmd="${input%% *}"
     args="${input#* }"
     [[ "$args" == "$cmd" ]] && args=""
-    
+
+    # Parse up to 3 arguments
     arg1="${args%% *}"
-    arg2="${args#* }"
-    [[ "$arg2" == "$arg1" ]] && arg2=""
+    local rest="${args#* }"
+    [[ "$rest" == "$arg1" ]] && rest=""
+
+    arg2="${rest%% *}"
+    arg3="${rest#* }"
+    [[ "$arg3" == "$arg2" ]] && arg3=""
+    [[ -z "$rest" ]] && arg2=""
     
     # Route
     case "$cmd" in
@@ -3868,8 +4661,10 @@ run_command() {
         renew)              cmd_renew "$arg1" "$arg2" ;;
         reload)             cmd_reload "$arg1" ;;
         dossier)            cmd_dossier "$arg1" "$arg2" ;;
+        addon)              cmd_addon "$arg1" "$arg2" "$arg3" ;;
         apply-license|apply) cmd_apply_license "$arg1" "$arg2" ;;
         activate)           cmd_activate "$arg1" ;;
+        transfer)           cmd_transfer "$arg1" "$arg2" ;;
         export)             cmd_export ;;
         history|h)          cmd_history ;;
         refresh|clear)      show_header; show_stats; show_devices ;;
@@ -4030,13 +4825,13 @@ _f5lm_completions() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
     # Main commands
-    commands="add add-multi remove list check details renew reload dossier activate apply-license export history help quit exit"
+    commands="add add-multi remove list check details renew reload dossier addon activate apply-license transfer export history help quit exit"
 
     # Commands that take an IP address argument
-    local ip_commands="check details renew reload dossier activate apply-license remove"
+    local ip_commands="check details renew reload dossier addon activate apply-license transfer remove"
 
     case "$prev" in
-        check|details|renew|reload|dossier|activate|apply-license|remove)
+        check|details|renew|reload|dossier|addon|activate|apply-license|transfer|remove)
             # Complete with device IPs from database
             if [[ -f "${HOME}/.f5lm/devices.json" ]]; then
                 devices=$(jq -r '.[].ip' "${HOME}/.f5lm/devices.json" 2>/dev/null)
@@ -4096,6 +4891,7 @@ _f5lm() {
         'dossier:Generate dossier for license activation'
         'activate:Full license activation wizard'
         'apply-license:Apply license file to device'
+        'transfer:Transfer VE license to another system'
         'export:Export devices to CSV'
         'history:Show operation history'
         'help:Show help information'
@@ -4123,7 +4919,7 @@ _f5lm() {
                         'special:special:(all)' \
                         'devices:device:_f5lm_devices'
                     ;;
-                details|renew|reload|dossier|activate|apply-license|remove)
+                details|renew|reload|dossier|activate|apply-license|transfer|remove)
                     _f5lm_devices
                     ;;
             esac

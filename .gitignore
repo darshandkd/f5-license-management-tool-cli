@@ -1,0 +1,38 @@
+# Session and temporary files
+.call_count
+.circuit_breaker_*
+.exit_signals
+.last_reset
+.ralph_session*
+.response_analysis
+progress.json
+status.json
+
+# Log files
+logs/
+*.log
+
+# Backup files
+backup/
+*.bak
+*.backup
+
+# Planning/temporary docs
+@*.md
+PROMPT.md
+CLAUDE.md
+
+# Empty directories
+specs/
+docs/generated/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE/Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
