@@ -509,10 +509,9 @@ Basic Usage (auto-retrieve base key):
       MANUAL ACTIVATION STEPS
       1. Copy the dossier from above (or from: ~/.f5lm/dossier_addon_192_168_1_100_20260126_111453.txt)
       2. Go to: https://activate.f5.com/license/dossier.jsp
-      3. Paste the dossier
-      4. Enter your add-on key when prompted: AMXZF-ANVER-AGIXS-PCTYM-EQRKIV
-      5. Download the license file
-      6. Run: f5lm apply-license 192.168.1.100 to upload it
+      3. Paste the dossier (contains both base and add-on keys)
+      4. Download the license file
+      5. Run: f5lm apply-license 192.168.1.100 to upload it
 
 Advanced Usage (provide base key explicitly):
 
@@ -566,7 +565,7 @@ Offline Mode Example (no internet connectivity):
       ║                                                                 ║
       ║  1. Copy the dossier above (or from the saved file)           ║
       ║  2. Go to: https://activate.f5.com/license/dossier.jsp         ║
-      ║  3. Paste the dossier and enter your add-on key               ║
+      ║  3. Paste the dossier (contains both base and add-on keys)    ║
       ║  4. Download the license file                                  ║
       ║  5. Choose one of the options below to apply it               ║
       ╚═════════════════════════════════════════════════════════════════╝
@@ -786,7 +785,6 @@ Scenario B: Offline Device (no internet connectivity)
     # 2. External step: Go to F5 portal manually
     #    - Visit: https://activate.f5.com/license/dossier.jsp
     #    - Paste the dossier from ~/.f5lm/dossier_addon_10_1_1_50_*.txt
-    #    - Enter add-on key: ADDON-98765-43210-ZYXWV-UTSRQ
     #    - Download enhanced license file
 
     # 3. Apply the enhanced license
